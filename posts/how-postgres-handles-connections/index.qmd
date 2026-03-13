@@ -1,0 +1,14 @@
+---
+title: "How Does Postgres Handle Connections?"
+date: "2026-03-15"
+code-fold: true
+description: "Recently, OpenAI published a blog on how they scaled Postgres for 800M users. In this blog, we begin to explore the internals of postgres- starting with how postgres handles incoming connections."
+---
+
+### Credits and Resources:
+
+To build this server, I've relied on the following resources:
+
+1. [this](https://github.com/vikrantmehta123/http-server) repository for an imp
+   
+---
