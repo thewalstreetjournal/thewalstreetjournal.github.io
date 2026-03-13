@@ -1,0 +1,19 @@
+.navbar-title {
+    font-family: "Playfair Display", serif;
+    font-weight: 700;
+    font-style: normal;
+}
+
+.slideshow-container {
+    position: relative;
+  }
+  
+  /* Slides */
+  .mySlides {
+    display: none;
+    padding: 4px;
+    text-align: center;
+  }
+  
+  /* Add a blue color to the author */
+  .author {color: cornflowerblue;}
