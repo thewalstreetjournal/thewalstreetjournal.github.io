@@ -2,6 +2,7 @@
   {
     "listing": "/index.html",
     "items": [
+      "/posts/how-postgres-stores-data/index.html",
       "/posts/how-postgres-handles-connections/index.html"
     ]
   }
