@@ -372,6 +372,7 @@ gtag('config', 'G-CKDPXJ4Y38', { 'anonymize_ip': true});
   <li><a href="#how-does-postgres-handle-connections" id="toc-how-does-postgres-handle-connections" class="nav-link active" data-scroll-target="#how-does-postgres-handle-connections">How Does Postgres Handle Connections?</a>
   <ul class="collapse">
   <li><a href="#prerequisites" id="toc-prerequisites" class="nav-link" data-scroll-target="#prerequisites">Prerequisites</a></li>
+  <li><a href="#walkthrough" id="toc-walkthrough" class="nav-link" data-scroll-target="#walkthrough">Walkthrough</a></li>
   <li><a href="#credits-and-resources" id="toc-credits-and-resources" class="nav-link" data-scroll-target="#credits-and-resources">Credits and Resources:</a></li>
   </ul></li>
   </ul>
@@ -409,6 +410,9 @@ gtag('config', 'G-CKDPXJ4Y38', { 'anonymize_ip': true});
 <span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Run the docker container for postgres</span></span>
 <span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> run <span class="at">-d</span> <span class="at">--name</span> postgres <span class="at">--network</span> pgnet <span class="at">-e</span> POSTGRES_PASSWORD=secret postgres-17.6:v1</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <hr>
+</section>
+<section id="walkthrough" class="level3">
+<h3 class="anchored" data-anchor-id="walkthrough">Walkthrough</h3>
 <p>Now that we have the docker containers built, let’s begin the walkthrough.</p>
 <p>Let’s exec into the postgres image:</p>
 <div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> exec <span class="at">-it</span> postgres bash</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
@@ -467,6 +471,7 @@ gtag('config', 'G-CKDPXJ4Y38', { 'anonymize_ip': true});
 <ol type="1">
 <li><a href="https://15445.courses.cs.cmu.edu/fall2025/">Intro to Database Systems by CMU</a></li>
 <li><a href="https://github.com/postgres/postgres">Postgres Source Code</a></li>
+<li>You can also check out the youtube video I made on this post <a href="https://youtu.be/iJHdUqGNBlk?si=3dzsBjD1mbFPpQoj">here</a>.</li>
 </ol>
 <hr>
 

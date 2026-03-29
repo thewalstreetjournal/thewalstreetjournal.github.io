@@ -1,0 +1,186 @@
+---
+title: "How Does Postgres Store Data?"
+date: "2026-03-15"
+code-fold: true
+description: "Data stored in postgres is persisted on disk. But how exactly? In this blog post, we explore how postgres stores data on disk."
+---
+
+# How Does Postgres Store Data?
+
+As we all know, postgres is an awesome, open source database system. In these series of blog posts, I am going to explore some internals of Postgres. 
+
+In this post, we explore how postgres internally organizes and stores data that we expect it to store. 
+
+---
+
+## Prerequisites
+
+For this ( and subsequent ) posts, I am assuming that the reader:
+
+- Knows what docker containers are, how to build and run them.
+- Is familiar with the terms processes and threads
+
+For this post, I am using a docker container for postgres and a docker container for a simple application connecting to postgres. Both files can be found here.
+
+To build the containers, run:
+
+```bash
+# Build the postgres and the python application images
+docker build -t postgres-17.6:v1 .
+docker build -f Dockerfile.client -t pg-client:v1 .
+
+# To let the python app talk to postgres, we create a docker network
+docker network create pgnet
+
+# Run the docker container for postgres
+docker run -d --name postgres --network pgnet -e POSTGRES_PASSWORD=secret postgres-17.6:v1
+
+# Run the docker container for the python application
+```
+
+---
+
+## Storage in Postgres
+
+Before we start the actual exploration, note that in the Dockerfile, we have created a user `myuser` and a database `mydatabase` in our postgres server. 
+
+Now, let's create a table in our database so that we can insert some data. Let's exec into the postgres container using:
+
+```bash
+docker exec -it postgres bash
+```
+
+Once inside, we can do: `psql -U myuser -d mydatabase`. This opens a client connection to `mydatabase` using `myuser`. From the postgres server point of view, this is just another connection. Now we can create the table and insert some data as:
+
+```sql
+CREATE TABLE mytable (id INT, name TEXT);
+
+INSERT INTO mytable VALUES (1, 'Alice');
+```
+
+We receive a response from the postgres server saying that the insert was successfully done. Postgres has successfully persisted this data onto disk. But what does it mean to "persist data on disk"? At the end of the day, these are simply files! Whatever data we insert is stored in some file, in some directory created by the postgres server. 
+
+We can do `SHOW data_directory;` to get the directory path where the data files are stored. I see `/var/lib/postgresql/data` as the output. On most Linux/Docker based containers, this is going to be the path unless configured differently. Let's get into this directory and see what's there:  
+
+```bash
+# First close the client connection and get out of psql
+exit
+
+cd /var/lib/postgresql/data
+ls -l
+```
+
+We see the following output:
+
+```bash
+postgres@7997d00b7436:~/data$ ls -l
+total 128
+drwx------ 6 postgres postgres  4096 Mar 14 13:05 base
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 global
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_commit_ts
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_dynshmem
+-rw------- 1 postgres postgres  5743 Mar 14 13:05 pg_hba.conf
+-rw------- 1 postgres postgres  2640 Mar 14 13:05 pg_ident.conf
+drwx------ 4 postgres postgres  4096 Mar 14 13:05 pg_logical
+drwx------ 4 postgres postgres  4096 Mar 14 13:05 pg_multixact
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_notify
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_replslot
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_serial
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_snapshots
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_stat
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_stat_tmp
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_subtrans
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_tblspc
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_twophase
+-rw------- 1 postgres postgres     3 Mar 14 13:05 PG_VERSION
+drwx------ 4 postgres postgres  4096 Mar 14 13:05 pg_wal
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_xact
+-rw------- 1 postgres postgres    88 Mar 14 13:05 postgresql.auto.conf
+-rw------- 1 postgres postgres 30777 Mar 14 13:05 postgresql.conf
+-rw------- 1 postgres postgres    36 Mar 14 13:05 postmaster.opts
+-rw------- 1 postgres postgres    94 Mar 14 13:05 postmaster.pid
+```
+
+Already we see there are some files and directories present in this. You can check what these files contain by doing: `cat <filename>`. Mostly these are configuration files that we're not going to get into now. We're also not going to touch any other directories than `base`. Each is a separate blog post on its own!
+
+If we do, `cd /base/ && ls -l`, we see several subdirectories named after some numbers:
+
+```bash
+postgres@7997d00b7436:~/data$ cd base/ && ls -l
+total 16
+drwx------ 2 postgres postgres 4096 Mar 14 13:08 1
+drwx------ 2 postgres postgres 4096 Mar 14 13:05 16385
+drwx------ 2 postgres postgres 4096 Mar 14 13:05 4
+drwx------ 2 postgres postgres 4096 Mar 14 13:07 5
+```
+
+These numbers are called Object IDs or OIDs in Postgres. Every object that postgres creates- table, index, function, role, database, anything - gets an OID. These subdirectories are data directories for each of the database that we have in our postgres server. There are some default databases and there is one database that we have created. 
+
+Each of these directories are going to contain some files containing the data of the tables in the database and some files for additional metadata for efficiency. Let's find out which of these directories is for `mydatabase`. 
+
+```bash
+# Connect to postgres server as a client
+psql -U myuser -d mydatabase
+
+SELECT oid, datname FROM pg_database;
+```
+
+I see that `mydatabase` has an OID of 16385. This number might be different for you. There are other default and template databases as well, which we don't have to worry about for now. `exit` this connection. 
+
+Now, we can `cd` into the directory for our database and see what's present there. 
+
+```bash
+cd 16385/ && ls
+```
+
+Whoa! We have just one table with just one row in `mydatabase` yet there are about 300 files present in this directory. These are mostly system catalogs that postgres cloned from the template database.
+
+Now, let's try to find the file for our table. 
+
+```sql
+select relname, relfilenode, reltablespace from pg_class where relname = 'mytable';
+```
+
+We see the output as:
+
+```sql
+ relname | relfilenode | reltablespace 
+---------+-------------+---------------
+ mytable |       16390 |             0
+```
+
+The `relfilenode` is the file name for our table. If we go back to the data directory, the file 16390 contains the data that we inserted. But this is a binary file. At times, databases will apply some encoding or compression while storing data in files. As a result, the files are not directly readable- we can't simply do `cat <filename>` and expect to read the entire contents. So how can we understand this data file and the file structure?
+
+When postgres stores data, it doesn't store one row or a few bytes. It thinks in terms of "pages" or "blocks". Each block is given a fixed size of 8KB by default, though we can change this while setting up postgres. A file is made up of one or more such blocks. Naturally, it implies that size of each file will be in multiple of 8KB. Any data file of any database (even the system catalogs) are organized into blocks.
+
+We can see that there seem to be several different files here- these are called "forks". Each relation (i.e. table) can have upto four "forks":
+| File | Fork | Purpose |
+|------|------|---------|
+| `{filenode}` | main | Actual row data |
+| `{filenode}_fsm` | FSM | Free Space Map — tracks available space per page. Used for efficiency |
+| `{filenode}_vm` | VM | Visibility Map — tracks per-page visibility and freeze status. Used for concurrency control |
+| `{filenode}_init` | init | Unlogged tables/indexes only — template for reset after crash |
+
+
+We can list the binary contents of the `16390` file by doing `hexdump 16390`. This isn't very helpful ofcourse since it's binary, but observe that at the beginning there are a few bytes written and there are a few bytes written at the end. We can decode this binary dump to see if we can interpret this.  
+
+The structure of a postgres data file looks something like the following:
+
+<!-- TODO: Insert the image of a segment files containing several pages -->
+
+As we can see, the table's data is broken into "segments" of size 1GB ( this too is configurable ). For our table, if we had 4GB of data, the segment files will be named as: `16390`, `16390.1`, `16390.2`, and `16390.3`. Each segment file is made of one or more blocks. Each block has some headers, a slot array, and the rows. First block of a segment has some special headers as well. The slot array tells the offset for a row within the block. The slot array grows from the top while the rows grow from the bottom. The space in between them is the "free space" where new inserts can go. 
+
+Now that we know how the data is organized in a segment file, let's see if we can interpret it. We won't get into headers that much, but rather focus on the ItemIdData array and the tuple data. 
+
+---
+
+## Credits and Resources:
+
+For this post, I have heavily used Claude Code. Along with that, I have relied on the following resources: 
+
+1. [Intro to Database Systems, CMU]() 
+2. [PostgreSQL Source Code]()
+ 
+ 
+   
+---

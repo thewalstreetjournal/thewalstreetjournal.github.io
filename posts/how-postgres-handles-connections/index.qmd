@@ -38,6 +38,8 @@ docker run -d --name postgres --network pgnet -e POSTGRES_PASSWORD=secret postgr
 
 ---
 
+### Walkthrough
+
 Now that we have the docker containers built, let's begin the walkthrough. 
 
 Let's exec into the postgres image:
@@ -125,7 +127,7 @@ For this post, I have heavily used Claude Code. Along with that, I have relied o
 
 1. [Intro to Database Systems by CMU](https://15445.courses.cs.cmu.edu/fall2025/) 
 2. [Postgres Source Code](https://github.com/postgres/postgres)
- 
+3. You can also check out the youtube video I made on this post [here](https://youtu.be/iJHdUqGNBlk?si=3dzsBjD1mbFPpQoj). 
  
    
 ---

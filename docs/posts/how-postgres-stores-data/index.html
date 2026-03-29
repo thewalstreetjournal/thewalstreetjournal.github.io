@@ -7,7 +7,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
 
 <meta name="dcterms.date" content="2026-03-15">
-<meta name="description" content="Data stored in postgres is persisted on disk as files. But how exactly?">
+<meta name="description" content="Data stored in postgres is persisted on disk. But how exactly? In this blog post, we explore how postgres stores data on disk.">
 
 <title>How Does Postgres Store Data? – The WAL Street Journal</title>
 <style>
@@ -340,7 +340,7 @@ gtag('config', 'G-CKDPXJ4Y38', { 'anonymize_ip': true});
       <h1 class="title">How Does Postgres Store Data?</h1>
                   <div>
         <div class="description">
-          Data stored in postgres is persisted on disk as files. But how exactly?
+          Data stored in postgres is persisted on disk. But how exactly? In this blog post, we explore how postgres stores data on disk.
         </div>
       </div>
                 </div>
@@ -372,6 +372,7 @@ gtag('config', 'G-CKDPXJ4Y38', { 'anonymize_ip': true});
   <li><a href="#how-does-postgres-store-data" id="toc-how-does-postgres-store-data" class="nav-link active" data-scroll-target="#how-does-postgres-store-data">How Does Postgres Store Data?</a>
   <ul class="collapse">
   <li><a href="#prerequisites" id="toc-prerequisites" class="nav-link" data-scroll-target="#prerequisites">Prerequisites</a></li>
+  <li><a href="#storage-in-postgres" id="toc-storage-in-postgres" class="nav-link" data-scroll-target="#storage-in-postgres">Storage in Postgres</a></li>
   <li><a href="#credits-and-resources" id="toc-credits-and-resources" class="nav-link" data-scroll-target="#credits-and-resources">Credits and Resources:</a></li>
   </ul></li>
   </ul>
@@ -390,8 +391,8 @@ gtag('config', 'G-CKDPXJ4Y38', { 'anonymize_ip': true});
 <p>As we all know, postgres is an awesome, open source database system. In these series of blog posts, I am going to explore some internals of Postgres.</p>
 <p>In this post, we explore how postgres internally organizes and stores data that we expect it to store.</p>
 <hr>
-<section id="prerequisites" class="level3">
-<h3 class="anchored" data-anchor-id="prerequisites">Prerequisites</h3>
+<section id="prerequisites" class="level2">
+<h2 class="anchored" data-anchor-id="prerequisites">Prerequisites</h2>
 <p>For this ( and subsequent ) posts, I am assuming that the reader:</p>
 <ul>
 <li>Knows what docker containers are, how to build and run them.</li>
@@ -411,28 +412,90 @@ gtag('config', 'G-CKDPXJ4Y38', { 'anonymize_ip': true});
 <span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="co"># Run the docker container for the python application</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <hr>
-<p>Before we start the actual exploration, note that in the Dockerfile, we have created a user and a database in our postgres server.</p>
+</section>
+<section id="storage-in-postgres" class="level2">
+<h2 class="anchored" data-anchor-id="storage-in-postgres">Storage in Postgres</h2>
+<p>Before we start the actual exploration, note that in the Dockerfile, we have created a user <code>myuser</code> and a database <code>mydatabase</code> in our postgres server.</p>
 <p>Now, let’s create a table in our database so that we can insert some data. Let’s exec into the postgres container using:</p>
 <div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> exec <span class="at">-it</span> postgres bash</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <p>Once inside, we can do: <code>psql -U myuser -d mydatabase</code>. This opens a client connection to <code>mydatabase</code> using <code>myuser</code>. From the postgres server point of view, this is just another connection. Now we can create the table and insert some data as:</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> mytable ();</span>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> mytable (<span class="kw">id</span> <span class="dt">INT</span>, name TEXT);</span>
 <span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> mytable () <span class="kw">VALUES</span> ();</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<p>We receive a response from the postgres server saying that the insert was successfully done. Postgres has successfully persisted this data onto disk. But what does it mean to “persist data on disk”? At the end of the day, these are simply files! Whatever data we insert is stored in some file created by the postgres server.</p>
-<p>Let’s see where this file lives. The variable <code>$PG_DATA</code> tells the directory path where postgres stores its data. Let’s get into this directory and see what’s there:</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="va">$PG_DATA</span></span>
-<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> <span class="va">$PG_DATA</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> mytable <span class="kw">VALUES</span> (<span class="dv">1</span>, <span class="st">'Alice'</span>);</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>We receive a response from the postgres server saying that the insert was successfully done. Postgres has successfully persisted this data onto disk. But what does it mean to “persist data on disk”? At the end of the day, these are simply files! Whatever data we insert is stored in some file, in some directory created by the postgres server.</p>
+<p>We can do <code>SHOW data_directory;</code> to get the directory path where the data files are stored. I see <code>/var/lib/postgresql/data</code> as the output. On most Linux/Docker based containers, this is going to be the path unless configured differently. Let’s get into this directory and see what’s there:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># First close the client connection and get out of psql</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="bu">exit</span></span>
 <span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-l</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<p>We see a</p>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> /var/lib/postgresql/data</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-l</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>We see the following output:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres@7997d00b7436:~/data$</span> ls <span class="at">-l</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">total</span> 128</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 6 postgres postgres  4096 Mar 14 13:05 base</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 global</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_commit_ts</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_dynshmem</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="ex">-rw-------</span> 1 postgres postgres  5743 Mar 14 13:05 pg_hba.conf</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="ex">-rw-------</span> 1 postgres postgres  2640 Mar 14 13:05 pg_ident.conf</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 4 postgres postgres  4096 Mar 14 13:05 pg_logical</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 4 postgres postgres  4096 Mar 14 13:05 pg_multixact</span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_notify</span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_replslot</span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_serial</span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_snapshots</span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_stat</span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_stat_tmp</span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_subtrans</span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_tblspc</span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_twophase</span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="ex">-rw-------</span> 1 postgres postgres     3 Mar 14 13:05 PG_VERSION</span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 4 postgres postgres  4096 Mar 14 13:05 pg_wal</span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_xact</span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a><span class="ex">-rw-------</span> 1 postgres postgres    88 Mar 14 13:05 postgresql.auto.conf</span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a><span class="ex">-rw-------</span> 1 postgres postgres 30777 Mar 14 13:05 postgresql.conf</span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a><span class="ex">-rw-------</span> 1 postgres postgres    36 Mar 14 13:05 postmaster.opts</span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a><span class="ex">-rw-------</span> 1 postgres postgres    94 Mar 14 13:05 postmaster.pid</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Already we see there are some files and directories present in this. You can check what these files contain by doing: <code>cat &lt;filename&gt;</code>. Mostly these are configuration files that we’re not going to get into now. We’re also not going to touch any other directories than <code>base</code>. Each is a separate blog post on its own!</p>
+<p>If we do, <code>cd /base/ &amp;&amp; ls -l</code>, we see several subdirectories named after some numbers:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres@7997d00b7436:~/data$</span> cd base/ <span class="kw">&amp;&amp;</span> <span class="fu">ls</span> <span class="at">-l</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">total</span> 16</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres 4096 Mar 14 13:08 1</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres 4096 Mar 14 13:05 16385</span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres 4096 Mar 14 13:05 4</span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres 4096 Mar 14 13:07 5</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>These numbers are called Object IDs or OIDs in Postgres. Every object that postgres creates- table, index, function, role, database, anything - gets an OID. These subdirectories are data directories for each of the database that we have in our postgres server. There are some default databases and there is one database that we have created.</p>
+<p>Each of these directories are going to contain some files containing the data of the tables in the database and some files for additional metadata for efficiency. Let’s find out which of these directories is for <code>mydatabase</code>.</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb7"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Connect to postgres server as a client</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">psql</span> <span class="at">-U</span> myuser <span class="at">-d</span> mydatabase</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="ex">SELECT</span> oid, datname FROM pg_database<span class="kw">;</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>I see that <code>mydatabase</code> has an OID of 16385. This number might be different for you. There are other default and template databases as well, which we don’t have to worry about for now. <code>exit</code> this connection.</p>
+<p>Now, we can <code>cd</code> into the directory for our database and see what’s present there.</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb8"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> 16385/ <span class="kw">&amp;&amp;</span> <span class="fu">ls</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Whoa! We have just one table with just one row in <code>mydatabase</code> yet there are about 300 files present in this directory. These are mostly system catalogs that postgres cloned from the template database.</p>
+<p>Now, let’s try to find the file for our table.</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb9"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="kw">select</span> relname, relfilenode, reltablespace <span class="kw">from</span> pg_class <span class="kw">where</span> relname <span class="op">=</span> <span class="st">'mytable'</span>;</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>We see the output as:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb10"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a> relname | relfilenode | reltablespace </span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="co">---------+-------------+---------------</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a> mytable |       <span class="dv">16390</span> |             <span class="dv">0</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>The <code>relfilenode</code> is the file name for our table. If we go back to the data directory, the file 16390 contains the data that we inserted. But this is a binary file. At times, databases will apply some encoding or compression while storing data in files. As a result, the files are not directly readable- we can’t simply do <code>cat &lt;filename&gt;</code> and expect to read the entire contents. So how can we understand this data file and the file structure?</p>
+<p>When postgres stores data, it doesn’t store one row or a few bytes. It thinks in terms of “pages” or “blocks”. Each block is given a fixed size of 8KB by default, though we can change this while setting up postgres. A file is made up of one or more such blocks. Naturally, it implies that size of each file will be in multiple of 8KB. Any data file of any database (even the system catalogs) are organized into blocks.</p>
+<p>We can see that there seem to be several different files here- these are called “forks”. Each relation (i.e.&nbsp;table) can have upto four “forks”: | File | Fork | Purpose | |——|——|———| | <code>{filenode}</code> | main | Actual row data | | <code>{filenode}_fsm</code> | FSM | Free Space Map — tracks available space per page. Used for efficiency | | <code>{filenode}_vm</code> | VM | Visibility Map — tracks per-page visibility and freeze status. Used for concurrency control | | <code>{filenode}_init</code> | init | Unlogged tables/indexes only — template for reset after crash |</p>
+<p>We can list the binary contents of the <code>16390</code> file by doing <code>hexdump 16390</code>. This isn’t very helpful ofcourse since it’s binary, but observe that at the beginning there are a few bytes written and there are a few bytes written at the end. We can decode this binary dump to see if we can interpret this.</p>
+<p>The structure of a postgres data file looks something like the following:</p>
+<!-- TODO: Insert the image of a segment files containing several pages -->
+<p>As we can see, the table’s data is broken into “segments” of size 1GB ( this too is configurable ). For our table, if we had 4GB of data, the segment files will be named as: <code>16390</code>, <code>16390.1</code>, <code>16390.2</code>, and <code>16390.3</code>. Each segment file is made of one or more blocks. Each block has some headers, a slot array, and the rows. First block of a segment has some special headers as well. The slot array tells the offset for a row within the block. The slot array grows from the top while the rows grow from the bottom. The space in between them is the “free space” where new inserts can go.</p>
+<p>Now that we know how the data is organized in a segment file, let’s see if we can interpret it. We won’t get into headers that much, but rather focus on the ItemIdData array and the tuple data.</p>
 <hr>
 </section>
-<section id="credits-and-resources" class="level3">
-<h3 class="anchored" data-anchor-id="credits-and-resources">Credits and Resources:</h3>
+<section id="credits-and-resources" class="level2">
+<h2 class="anchored" data-anchor-id="credits-and-resources">Credits and Resources:</h2>
 <p>For this post, I have heavily used Claude Code. Along with that, I have relied on the following resources:</p>
 <ol type="1">
-<li><a href="">this</a> Intro to Database Systems, CMU. A fantastic course.</li>
-<li><a href=""></a> Postgres Source Code</li>
+<li><a href="">Intro to Database Systems, CMU</a></li>
+<li><a href="">PostgreSQL Source Code</a></li>
 </ol>
 <hr>
 
