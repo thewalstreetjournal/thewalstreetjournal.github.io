@@ -7,7 +7,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
 
 <meta name="dcterms.date" content="2026-03-15">
-<meta name="description" content="In production environments, there could be hundreds of clients wanting to connect and interact with Postgres. In this post, we see how Postgres handles concurrent connections.">
+<meta name="description" content="Postgres starts a separate process for every client connection. Here’s how that works, why it limits scale, and where it happens in the source code.">
 
 <title>How Does Postgres Handle Connections? – The WAL Street Journal</title>
 <style>
@@ -125,10 +125,10 @@ gtag('config', 'G-NMYW1XQTP9', { 'anonymize_ip': true});
 
 <link rel="stylesheet" href="../../styles.css">
 <meta property="og:title" content="How Does Postgres Handle Connections? – The WAL Street Journal">
-<meta property="og:description" content="In production environments, there could be hundreds of clients wanting to connect and interact with Postgres. In this post, we see how Postgres handles concurrent connections.">
+<meta property="og:description" content="Postgres starts a separate process for every client connection. Here’s how that works, why it limits scale, and where it happens in the source code.">
 <meta property="og:site_name" content="The WAL Street Journal">
 <meta name="twitter:title" content="How Does Postgres Handle Connections? – The WAL Street Journal">
-<meta name="twitter:description" content="In production environments, there could be hundreds of clients wanting to connect and interact with Postgres. In this post, we see how Postgres handles concurrent connections.">
+<meta name="twitter:description" content="Postgres starts a separate process for every client connection. Here’s how that works, why it limits scale, and where it happens in the source code.">
 <meta name="twitter:card" content="summary">
 </head>
 
@@ -351,7 +351,7 @@ gtag('config', 'G-NMYW1XQTP9', { 'anonymize_ip': true});
       <h1 class="title">How Does Postgres Handle Connections?</h1>
                   <div>
         <div class="description">
-          In production environments, there could be hundreds of clients wanting to connect and interact with Postgres. In this post, we see how Postgres handles concurrent connections.
+          Postgres starts a separate process for every client connection. Here’s how that works, why it limits scale, and where it happens in the source code.
         </div>
       </div>
                           <div class="quarto-categories">
@@ -384,12 +384,10 @@ gtag('config', 'G-NMYW1XQTP9', { 'anonymize_ip': true});
     <h2 id="toc-title">On this page</h2>
    
   <ul>
-  <li><a href="#how-does-postgres-handle-connections" id="toc-how-does-postgres-handle-connections" class="nav-link active" data-scroll-target="#how-does-postgres-handle-connections">How Does Postgres Handle Connections?</a>
-  <ul class="collapse">
-  <li><a href="#prerequisites" id="toc-prerequisites" class="nav-link" data-scroll-target="#prerequisites">Prerequisites</a></li>
+  <li><a href="#prerequisites" id="toc-prerequisites" class="nav-link active" data-scroll-target="#prerequisites">Prerequisites</a></li>
   <li><a href="#walkthrough" id="toc-walkthrough" class="nav-link" data-scroll-target="#walkthrough">Walkthrough</a></li>
-  <li><a href="#credits-and-resources" id="toc-credits-and-resources" class="nav-link" data-scroll-target="#credits-and-resources">Credits and Resources:</a></li>
-  </ul></li>
+  <li><a href="#source-code-walkthrough" id="toc-source-code-walkthrough" class="nav-link" data-scroll-target="#source-code-walkthrough">Source Code Walkthrough</a></li>
+  <li><a href="#credits-and-resources" id="toc-credits-and-resources" class="nav-link" data-scroll-target="#credits-and-resources">Credits and Resources</a></li>
   </ul>
 </nav>
     </div>
@@ -401,64 +399,165 @@ gtag('config', 'G-NMYW1XQTP9', { 'anonymize_ip': true});
 
 
 
-<p>Postgres works on a client-server model. There is a Postgres server that is running an infinite loop listening for new, incoming requests. Clients wanting to interact with Postgres connect with this server.</p>
-<section id="how-does-postgres-handle-connections" class="level1">
-<h1>How Does Postgres Handle Connections?</h1>
-<p>As we all know, postgres is an awesome, open source database system. In these series of blog posts, I am going to explore some internals of Postgres.</p>
-<p>In this blog, we explore how postgres handles incoming connections and what implications it has for performance and scale. We’ll try to do a walkthrough of this using a postgres container and exploring some of the postgres source code.</p>
+<p>Postgres works on a client-server model. A server process runs in a loop, waiting for clients to connect. Every time a client connects, Postgres starts a new operating-system process just for that client, and that process handles all of the client’s queries until it disconnects.</p>
+<p>In this post, we’ll watch this happen inside a Docker container, look at what it means for scaling Postgres, and find the place in the source code where the new process gets created.</p>
+<p>Prefer video? Here’s the same walkthrough:</p>
+<div class="quarto-video ratio ratio-16x9"><iframe data-external="1" src="https://www.youtube.com/embed/iJHdUqGNBlk" title="" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen=""></iframe></div>
 <hr>
 <section id="prerequisites" class="level3">
 <h3 class="anchored" data-anchor-id="prerequisites">Prerequisites</h3>
-<p>For this ( and subsequent ) posts, I am assuming that the reader:</p>
+<p>For this post, I’m assuming you:</p>
 <ul>
-<li>Knows what docker containers are, how to build and run them.</li>
-<li>Is familiar with the terms processes and threads</li>
+<li>Know what Docker containers are and how to build and run them.</li>
+<li>Are familiar with processes and threads.</li>
 </ul>
-<p>For this post, I am using a docker container for postgres and a docker container for a simple application connecting to postgres. Both files can be found here.</p>
-<p>To build the containers, run:</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Build the postgres and the python application images</span></span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> build <span class="at">-t</span> postgres-17.6:v1 .</span>
-<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> build <span class="at">-f</span> Dockerfile.client <span class="at">-t</span> pg-client:v1 .</span>
+<p>We’ll use two containers: one running Postgres, and one with a small Python script that connects to it. Create a folder with these three files.</p>
+<div class="callout callout-style-default callout-note callout-titled" title="Dockerfile (Postgres)">
+<div class="callout-header d-flex align-content-center collapsed" data-bs-toggle="collapse" data-bs-target=".callout-1-contents" aria-controls="callout-1" aria-expanded="false" aria-label="Toggle callout">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>Dockerfile (Postgres)
+</div>
+<div class="callout-btn-toggle d-inline-block border-0 py-1 ps-1 pe-0 float-end"><i class="callout-toggle"></i></div>
+</div>
+<div id="callout-1" class="callout-1-contents callout-collapse collapse">
+<div class="callout-body-container callout-body">
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode dockerfile code-with-copy"><code class="sourceCode dockerfile"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> postgres:17.6</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">USER</span> root</span>
 <span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="co"># To let the python app talk to postgres, we create a docker network</span></span>
-<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> network create pgnet</span>
-<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Run the docker container for postgres</span></span>
-<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> run <span class="at">-d</span> <span class="at">--name</span> postgres <span class="at">--network</span> pgnet <span class="at">-e</span> POSTGRES_PASSWORD=secret postgres-17.6:v1</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="co"># procps gives us `ps` inside the container</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">apt-get</span> update <span class="kw">&amp;&amp;</span> <span class="ex">apt-get</span> install <span class="at">-y</span> procps <span class="dt">\</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">&amp;&amp;</span> <span class="fu">rm</span> <span class="at">-rf</span> /var/lib/apt/lists/<span class="pp">*</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="co"># A user and database for the Python client to connect to</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="bu">echo</span> <span class="st">"CREATE USER myuser WITH PASSWORD 'mypassword'; CREATE DATABASE mydatabase OWNER myuser;"</span> <span class="dt">\</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">&gt;</span> /docker-entrypoint-initdb.d/init.sql</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPOSE</span> 5432</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="kw">USER</span> postgres</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</div>
+</div>
+</div>
+<div class="callout callout-style-default callout-note callout-titled" title="Dockerfile.client (Python client)">
+<div class="callout-header d-flex align-content-center collapsed" data-bs-toggle="collapse" data-bs-target=".callout-2-contents" aria-controls="callout-2" aria-expanded="false" aria-label="Toggle callout">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>Dockerfile.client (Python client)
+</div>
+<div class="callout-btn-toggle d-inline-block border-0 py-1 ps-1 pe-0 float-end"><i class="callout-toggle"></i></div>
+</div>
+<div id="callout-2" class="callout-2-contents callout-collapse collapse">
+<div class="callout-body-container callout-body">
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode dockerfile code-with-copy"><code class="sourceCode dockerfile"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> python:3.12-slim</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">pip</span> install psycopg2-binary</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="kw">COPY</span> connect.py /app/connect.py</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="kw">ENTRYPOINT</span> [<span class="st">"python"</span>, <span class="st">"/app/connect.py"</span>]</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</div>
+</div>
+</div>
+<div class="callout callout-style-default callout-note callout-titled" title="connect.py">
+<div class="callout-header d-flex align-content-center collapsed" data-bs-toggle="collapse" data-bs-target=".callout-3-contents" aria-controls="callout-3" aria-expanded="false" aria-label="Toggle callout">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>connect.py
+</div>
+<div class="callout-btn-toggle d-inline-block border-0 py-1 ps-1 pe-0 float-end"><i class="callout-toggle"></i></div>
+</div>
+<div id="callout-3" class="callout-3-contents callout-collapse collapse">
+<div class="callout-body-container callout-body">
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> sys</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> os</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> psycopg2</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>conn_params <span class="op">=</span> {</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">"host"</span>:     os.getenv(<span class="st">"PG_HOST"</span>, <span class="st">"postgres"</span>),</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="st">"port"</span>:     os.getenv(<span class="st">"PG_PORT"</span>, <span class="st">"5432"</span>),</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="st">"dbname"</span>:   os.getenv(<span class="st">"PG_DB"</span>,   <span class="st">"mydatabase"</span>),</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="st">"user"</span>:     os.getenv(<span class="st">"PG_USER"</span>, <span class="st">"myuser"</span>),</span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="st">"password"</span>: os.getenv(<span class="st">"PG_PASSWORD"</span>, <span class="st">"mypassword"</span>),</span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>cmd <span class="op">=</span> sys.argv[<span class="dv">1</span>] <span class="cf">if</span> <span class="bu">len</span>(sys.argv) <span class="op">&gt;</span> <span class="dv">1</span> <span class="cf">else</span> <span class="st">""</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> cmd <span class="op">==</span> <span class="st">"connect"</span>:</span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Open a connection, hold it for 30 seconds, then close it</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>    conn <span class="op">=</span> psycopg2.<span class="ex">connect</span>(<span class="op">**</span>conn_params)</span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="st">"Connected to postgres successfully."</span>)</span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    time.sleep(<span class="dv">30</span>)</span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>    conn.close()</span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a><span class="cf">elif</span> cmd <span class="op">==</span> <span class="st">"select"</span>:</span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Run a query that takes 30 seconds</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>    conn <span class="op">=</span> psycopg2.<span class="ex">connect</span>(<span class="op">**</span>conn_params)</span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>    cur <span class="op">=</span> conn.cursor()</span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="st">"Running SELECT pg_sleep(30) ..."</span>)</span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>    cur.execute(<span class="st">"SELECT pg_sleep(30)"</span>)</span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="st">"Done."</span>)</span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>    cur.close()</span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>    conn.close()</span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a><span class="cf">else</span>:</span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="st">"Usage: python connect.py [connect|select]"</span>)</span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>    sys.exit(<span class="dv">1</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</div>
+</div>
+</div>
+<p>All the code for this post is also on <a href="https://github.com/thewalstreetjournal/postgres-playlist/tree/main/001-how-postgres-handles-connections">GitHub</a>.</p>
+<p>Then build the images and start Postgres:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Build the Postgres and Python client images</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> build <span class="at">-t</span> postgres-17.6:v1 .</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> build <span class="at">-f</span> Dockerfile.client <span class="at">-t</span> pg-client:v1 .</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Create a network so the client container can reach Postgres by name</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> network create pgnet</span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Start Postgres</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> run <span class="at">-d</span> <span class="at">--name</span> postgres <span class="at">--network</span> pgnet <span class="at">-e</span> POSTGRES_PASSWORD=secret postgres-17.6:v1</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <hr>
 </section>
 <section id="walkthrough" class="level3">
 <h3 class="anchored" data-anchor-id="walkthrough">Walkthrough</h3>
-<p>Now that we have the docker containers built, let’s begin the walkthrough.</p>
-<p>Let’s exec into the postgres image:</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> exec <span class="at">-it</span> postgres bash</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Now that we have the docker containers built, let’s begin. Let’s exec into the postgres container:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> exec <span class="at">-it</span> postgres bash</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <p>Once inside, we can list all the processes running in our container by doing <code>ps aux</code>. We get the following output:</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres@0f41997a8b1b:/$</span> ps aux</span>
-<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">USER</span>         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND</span>
-<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>       1  0.0  0.1 217536 28556 <span class="pp">?</span>        Ss   Mar12   0:00 postgres</span>
-<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>      49  0.0  0.0 217668 10088 <span class="pp">?</span>        Ss   Mar12   0:00 postgres: checkpointer </span>
-<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>      50  0.0  0.0 217692  7436 <span class="pp">?</span>        Ss   Mar12   0:00 postgres: background writer </span>
-<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>      52  0.0  0.0 217536 10264 <span class="pp">?</span>        Ss   Mar12   0:00 postgres: walwriter </span>
-<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>      53  0.0  0.0 219112  9136 <span class="pp">?</span>        Ss   Mar12   0:00 postgres: autovacuum launcher </span>
-<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>      54  0.0  0.0 219120  8276 <span class="pp">?</span>        Ss   Mar12   0:00 postgres: logical replication launcher </span>
-<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>     399  1.3  0.0   7352  4096 pts/0    Ss   06:51   0:00 bash</span>
-<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>     406  0.0  0.0   9392  4116 pts/0    R+   06:51   0:00 ps aux</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<p>Already a lot seems to be going on, even though we have just freshly started the postgres server. There are several processes already running. We’ll get to the other processes later in the series, but for now the most important process for us is the one with PID 1. This is the <strong>postmaster</strong>. When we start postgres, the postmaster process is started. It then spawns the other postgres processes that we see listed above.</p>
-<p>The postmaster process has a key responsibilty: it runs an infinite loop, waiting for new connections, and “handles” the incoming connections. Of course, there are other things as well that this postmaster process does, but for the purposes of this blog, we’ll focus on connection handling.</p>
-<p>Now, let’s try to connect to postgres using the python application. Open a new terminal and run:</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> run <span class="at">--rm</span> <span class="at">--network</span> pgnet pg-client:v1 connect</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<p>This is going to run the python application that will try to connect to the postgres, wait for a few seconds and then shut down. From the postgres server terminal, if we again run <code>ps aux</code>, we get a new entry now, the process with PID 432:</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres@0f41997a8b1b:/$</span> ps aux</span>
-<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">USER</span>         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND</span>
-<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>       1  0.0  0.1 217536 28556 <span class="pp">?</span>        Ss   Mar12   0:00 postgres</span>
-<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>      49  0.0  0.0 217668 10088 <span class="pp">?</span>        Ss   Mar12   0:00 postgres: checkpointer </span>
-<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>      50  0.0  0.0 217692  7436 <span class="pp">?</span>        Ss   Mar12   0:00 postgres: background writer </span>
-<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>      52  0.0  0.0 217536 10264 <span class="pp">?</span>        Ss   Mar12   0:00 postgres: walwriter </span>
-<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>      53  0.0  0.0 219112  9136 <span class="pp">?</span>        Ss   Mar12   0:00 postgres: autovacuum launcher </span>
-<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>      54  0.0  0.0 219120  8276 <span class="pp">?</span>        Ss   Mar12   0:00 postgres: logical replication launcher </span>
-<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>     426  0.6  0.0   7352  4060 pts/0    Ss   06:57   0:00 bash</span>
-<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>     432  0.0  0.0 219648 12960 <span class="pp">?</span>        Ss   06:57   0:00 postgres: myuser mydatabase 172.18.0.3<span class="er">(</span><span class="ex">48278</span><span class="kw">)</span> <span class="ex">idle</span></span>
-<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>     433  0.0  0.0   9392  4136 pts/0    R+   06:57   0:00 ps aux</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres@0f41997a8b1b:/$</span> ps aux</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">USER</span>         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>       1  0.0  0.1 217536 28556 <span class="pp">?</span>        Ss   Mar12   0:00 postgres</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>      49  0.0  0.0 217668 10088 <span class="pp">?</span>        Ss   Mar12   0:00 postgres: checkpointer </span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>      50  0.0  0.0 217692  7436 <span class="pp">?</span>        Ss   Mar12   0:00 postgres: background writer </span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>      52  0.0  0.0 217536 10264 <span class="pp">?</span>        Ss   Mar12   0:00 postgres: walwriter </span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>      53  0.0  0.0 219112  9136 <span class="pp">?</span>        Ss   Mar12   0:00 postgres: autovacuum launcher </span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>      54  0.0  0.0 219120  8276 <span class="pp">?</span>        Ss   Mar12   0:00 postgres: logical replication launcher </span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>     399  1.3  0.0   7352  4096 pts/0    Ss   06:51   0:00 bash</span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>     406  0.0  0.0   9392  4116 pts/0    R+   06:51   0:00 ps aux</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Already a lot seems to be going on, even though we have just freshly started this container. There are several processes already running. We’ll get to the other processes later in the series, but for now the most important process for us is the one with PID 1. This is the <strong>postmaster</strong>. When we start postgres, the postmaster process is started. It then spawns the other postgres processes that we see listed above.</p>
+<p>The postmaster process has a key responsibility: it runs an infinite loop, waiting for new connections, and “handles” the incoming connections. Of course, there are other things as well that this postmaster process does, but for the purposes of this blog, we’ll focus on connection handling.</p>
+<p>Now, let’s try to connect to postgres using the python application. In a second terminal (outside the container), run:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb7"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> run <span class="at">--rm</span> <span class="at">--network</span> pgnet pg-client:v1 connect</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>This is going to run the python application that will try to connect to the postgres, hold the connection open for 30 seconds and then close it. From the postgres server terminal, if we again run <code>ps aux</code>, we get a new entry now, the process with PID 432:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb8"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres@0f41997a8b1b:/$</span> ps aux</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">USER</span>         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>       1  0.0  0.1 217536 28556 <span class="pp">?</span>        Ss   Mar12   0:00 postgres</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>      49  0.0  0.0 217668 10088 <span class="pp">?</span>        Ss   Mar12   0:00 postgres: checkpointer </span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>      50  0.0  0.0 217692  7436 <span class="pp">?</span>        Ss   Mar12   0:00 postgres: background writer </span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>      52  0.0  0.0 217536 10264 <span class="pp">?</span>        Ss   Mar12   0:00 postgres: walwriter </span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>      53  0.0  0.0 219112  9136 <span class="pp">?</span>        Ss   Mar12   0:00 postgres: autovacuum launcher </span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>      54  0.0  0.0 219120  8276 <span class="pp">?</span>        Ss   Mar12   0:00 postgres: logical replication launcher </span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>     426  0.6  0.0   7352  4060 pts/0    Ss   06:57   0:00 bash</span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>     432  0.0  0.0 219648 12960 <span class="pp">?</span>        Ss   06:57   0:00 postgres: myuser mydatabase 172.18.0.3<span class="er">(</span><span class="ex">48278</span><span class="kw">)</span> <span class="ex">idle</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span>     433  0.0  0.0   9392  4136 pts/0    R+   06:57   0:00 ps aux</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <p>When our python application tried to connect to postgres server, the postmaster process jumped to action and created a new process to handle that connection request. From the name of the process, we can interpret a few things:</p>
 <ul>
 <li><code>postgres:</code> - this is the prefix attached to all the processes spawned by postmaster</li>
@@ -467,32 +566,49 @@ gtag('config', 'G-NMYW1XQTP9', { 'anonymize_ip': true});
 <li><code>172.18.0.3(48278)</code> - the host and port of the python application i.e.&nbsp;the client</li>
 <li><code>idle</code> - the state of the connection. Currently, the connection is sitting idle, without any work to do.</li>
 </ul>
+<p>We can see the same thing from inside Postgres. There is a view in Postgres called <code>pg_stat_activity</code>, which has one row per backend process:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb9"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">psql</span> <span class="at">-U</span> myuser <span class="at">-d</span> mydatabase <span class="at">-c</span> <span class="st">"SELECT pid, usename, datname, client_addr, state FROM pg_stat_activity WHERE backend_type = 'client backend';"</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>The <code>pid</code> column matches the process ID from <code>ps aux</code>. You’ll also see a second row for the <code>psql</code> session we just opened, because it’s a connection too, with its own backend process.</p>
 <p>If we try to simulate a select query that runs for 30 seconds using:</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> run <span class="at">--rm</span> <span class="at">--network</span> pgnet pg-client:v1 select</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb10"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> run <span class="at">--rm</span> <span class="at">--network</span> pgnet pg-client:v1 select</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <p>we see the state of the connection change from <code>idle</code> to <code>SELECT</code>. This is postgres indicating to us that the handler process is currently executing a SELECT request sent by the client.</p>
-<p>If we open another terminal and again try to connect to postgres server, we will see another process is being spawned. This is a key point: for every connection, the postgres server is going to have a process handling that connection. This process has its own stack, memory space, and the context switching overhead. At the same time, this process is entirely independent of the postgres server process. If the connection handling process crashes, there is no impact of it on the postgres server- it will continue to function as before.</p>
-<p>Postgres runs on a multi-process parallelization model. For every new connection, postgres is going to spawn a new process to handle it. When the connection is terminated, the process is also killed. Now, most modern database are not going to follow multi-process model, but rather the multi-threaded model. For each new connection, they’re gonna spawn (reuse from the threadpool) some threads. This is lightweight than the process based approach but if not carefully designed, can cause the database to crash.</p>
+<p>If we open another terminal and again try to connect to postgres server, we will see another process is being spawned. This is a key point: for every connection, the postgres server is going to have a process handling that connection. This process has its own stack, memory space, and the context switching overhead.</p>
+<p>At the same time, this process is independent of the other connections. If it exits or runs into an error, the postgres server continues to function as before. ( Note that a real crash, like a segfault or the Linux OOM killer killing the process, is different: postgres then stops all the processes and restarts. )</p>
+<p>Postgres runs on a process-per-connection model. For every new connection, postgres is going to spawn a new process to handle it. When the connection is terminated, the process exits. Now, many modern databases do not follow multi-process model, but rather the multi-threaded model. For each new connection, they’re gonna spawn (reuse from the threadpool) some threads. This is lighter than the process based approach but if not carefully designed, can cause the database to crash.</p>
 <p>The multi-process model of postgres has important implications on how we scale postgres.</p>
-<p>If we have an application we thousands of users who want to connect to the database, the postgres server is going to end up spawning thousands of processes. This is going to hamper the performance of our database. We simply cannot have a case where are spawning thousands of processes just to handle connections.</p>
-<p>To get around this, we can do several things. The OpenAI blog post lists a bunch of things they did to scale postgres to serve 800 million users. We’ll focus on a couple of them:</p>
+<p>If we have an application with thousands of users who want to connect to the database, the postgres server is going to end up spawning thousands of processes. This is going to hamper the performance of our database. We simply cannot have a case where we are spawning thousands of processes just to handle connections.</p>
+<p>To get around this, we can do several things. The <a href="https://openai.com/index/scaling-postgresql/">OpenAI blog post</a> lists a bunch of things they did to scale postgres to serve 800 million users. We’ll focus on a couple of them:</p>
 <ol type="1">
-<li><p>Setting <code>max_connections</code> parameter: at the most basic level, we can restrict the number of connections postgres will accept. By default, this is set to 100. After this limit is reached, the clients trying to connect will get an error. This safeguards the postgres server but doesn’t serve the clients well. So, we look at the next option.</p></li>
-<li><p>Using a load balancer like PgBouncer. In such a setup, the clients try to connect to the load balancer and the load balancer maintains a small pool of connections with postgres. As a result, from our application’s point of view, there could be thousands of connections but from the point of view of the database, there are only a handful of connections.</p></li>
+<li><p>Setting <code>max_connections</code> parameter: at the most basic level, we can restrict the number of connections postgres will accept. By default, this is set to 100. After this limit is reached, the clients trying to connect will get an error. Out of these 100, a few connections (3 by default, set by <code>superuser_reserved_connections</code>) are kept aside for superusers, so that an admin can still log in and fix things even when all the other connections are used up. This safeguards the postgres server but doesn’t serve the clients well. So, we look at the next option.</p></li>
+<li><p>Using a connection pooler like PgBouncer. In such a setup, the clients try to connect to the pooler and the pooler maintains a small pool of connections with postgres. As a result, from our application’s point of view, there could be thousands of connections but from the point of view of the database, there are only a handful of connections.</p></li>
 </ol>
+<hr>
+</section>
+<section id="source-code-walkthrough" class="level3">
+<h3 class="anchored" data-anchor-id="source-code-walkthrough">Source Code Walkthrough</h3>
+<p>Let’s see where this happens in the postgres source code. I’m using the <code>REL_17_6</code> branch here, so the line numbers in the links match postgres 17.6.</p>
+<p>The postmaster runs an infinite loop called <code>ServerLoop</code> in <code>postmaster.c</code>. When a new client connects, the loop accepts the connection and calls <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/postmaster/postmaster.c#L3545"><code>BackendStartup</code></a>. This function is called once for every new connection. It does some bookkeeping for the new backend, like generating a cancel key, and then calls <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/postmaster/launch_backend.c#L231"><code>postmaster_child_launch</code></a>.</p>
+<p><code>postmaster_child_launch</code> lives in <code>launch_backend.c</code>, and this is where the fork actually happens:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb11"><pre class="sourceCode c code-with-copy"><code class="sourceCode c"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a>pid <span class="op">=</span> fork_process<span class="op">();</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>pid <span class="op">==</span> <span class="dv">0</span><span class="op">)</span>               <span class="co">/* child */</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Close the postmaster's sockets */</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>    ClosePostmasterPorts<span class="op">(</span>child_type <span class="op">==</span> B_LOGGER<span class="op">);</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">...</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p><code>fork_process()</code> is a small wrapper around the <code>fork()</code> system call. After the fork, there are two processes running the same code. In the child (<code>pid == 0</code>), the first thing it does is close the postmaster’s listening sockets, since it doesn’t need them. But it keeps the socket for its own client. This is the “copy of the socket” I mentioned earlier: <code>fork()</code> copies all the open file descriptors of the parent, so the child gets the client’s connection for free.</p>
+<p>That’s it- one <code>fork()</code> per connection. Every backend process we saw in <code>ps aux</code> was created here.</p>
 <hr>
 </section>
 <section id="credits-and-resources" class="level3">
-<h3 class="anchored" data-anchor-id="credits-and-resources">Credits and Resources:</h3>
+<h3 class="anchored" data-anchor-id="credits-and-resources">Credits and Resources</h3>
 <p>For this post, I have heavily used Claude Code. Along with that, I have relied on the following resources:</p>
 <ol type="1">
 <li><a href="https://15445.courses.cs.cmu.edu/fall2025/">Intro to Database Systems by CMU</a></li>
-<li><a href="https://github.com/postgres/postgres">Postgres Source Code</a></li>
-<li>You can also check out the youtube video I made on this post <a href="https://youtu.be/iJHdUqGNBlk?si=3dzsBjD1mbFPpQoj">here</a>.</li>
+<li><a href="https://github.com/postgres/postgres/tree/REL_17_6">Postgres Source Code</a></li>
 </ol>
 <hr>
 
 
-</section>
 </section>
 
 </main> <!-- /main -->

@@ -3,39 +3,113 @@ title: "How Does Postgres Handle Connections?"
 date: "2026-03-15"
 categories: [postgres, internals]
 code-fold: true
-description: "In production environments, there could be hundreds of clients wanting to connect and interact with Postgres. In this post, we see how Postgres handles concurrent connections."
+description: "Postgres starts a separate process for every client connection. Here's how that works, why it limits scale, and where it happens in the source code."
 ---
 
-Postgres works on a client-server model. There is a Postgres server that is running an infinite loop listening for new, incoming requests. Clients wanting to interact with Postgres connect with this server.
+Postgres works on a client-server model. A server process runs in a loop, waiting for clients to connect. Every time a client connects, Postgres starts a new operating-system process just for that client, and that process handles all of the client's queries until it disconnects.
 
-# How Does Postgres Handle Connections?
+In this post, we'll watch this happen inside a Docker container, look at what it means for scaling Postgres, and find the place in the source code where the new process gets created.
 
-As we all know, postgres is an awesome, open source database system. In these series of blog posts, I am going to explore some internals of Postgres. 
+Prefer video? Here's the same walkthrough:
 
-In this blog, we explore how postgres handles incoming connections and what implications it has for performance and scale. We'll try to do a walkthrough of this using a postgres container and exploring some of the postgres source code. 
+{{< video https://www.youtube.com/watch?v=iJHdUqGNBlk >}}
 
 ---
 
 ### Prerequisites
 
-For this ( and subsequent ) posts, I am assuming that the reader:
+For this post, I'm assuming you:
 
-- Knows what docker containers are, how to build and run them.
-- Is familiar with the terms processes and threads
+- Know what Docker containers are and how to build and run them.
+- Are familiar with processes and threads.
 
-For this post, I am using a docker container for postgres and a docker container for a simple application connecting to postgres. Both files can be found here.
+We'll use two containers: one running Postgres, and one with a small Python script that connects to it. Create a folder with these three files.
 
-To build the containers, run:
+::: {.callout-note collapse="true" title="Dockerfile (Postgres)"}
+```dockerfile
+FROM postgres:17.6
+
+USER root
+
+# procps gives us `ps` inside the container
+RUN apt-get update && apt-get install -y procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# A user and database for the Python client to connect to
+RUN echo "CREATE USER myuser WITH PASSWORD 'mypassword'; CREATE DATABASE mydatabase OWNER myuser;" \
+    > /docker-entrypoint-initdb.d/init.sql
+
+EXPOSE 5432
+
+USER postgres
+```
+:::
+
+::: {.callout-note collapse="true" title="Dockerfile.client (Python client)"}
+```dockerfile
+FROM python:3.12-slim
+
+RUN pip install psycopg2-binary
+
+COPY connect.py /app/connect.py
+
+ENTRYPOINT ["python", "/app/connect.py"]
+```
+:::
+
+::: {.callout-note collapse="true" title="connect.py"}
+```python
+import sys
+import os
+import time
+import psycopg2
+
+conn_params = {
+    "host":     os.getenv("PG_HOST", "postgres"),
+    "port":     os.getenv("PG_PORT", "5432"),
+    "dbname":   os.getenv("PG_DB",   "mydatabase"),
+    "user":     os.getenv("PG_USER", "myuser"),
+    "password": os.getenv("PG_PASSWORD", "mypassword"),
+}
+
+cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+
+if cmd == "connect":
+    # Open a connection, hold it for 30 seconds, then close it
+    conn = psycopg2.connect(**conn_params)
+    print("Connected to postgres successfully.")
+    time.sleep(30)
+    conn.close()
+
+elif cmd == "select":
+    # Run a query that takes 30 seconds
+    conn = psycopg2.connect(**conn_params)
+    cur = conn.cursor()
+    print("Running SELECT pg_sleep(30) ...")
+    cur.execute("SELECT pg_sleep(30)")
+    print("Done.")
+    cur.close()
+    conn.close()
+
+else:
+    print("Usage: python connect.py [connect|select]")
+    sys.exit(1)
+```
+:::
+
+All the code for this post is also on [GitHub](https://github.com/thewalstreetjournal/postgres-playlist/tree/main/001-how-postgres-handles-connections).
+
+Then build the images and start Postgres:
 
 ```bash
-# Build the postgres and the python application images
+# Build the Postgres and Python client images
 docker build -t postgres-17.6:v1 .
 docker build -f Dockerfile.client -t pg-client:v1 .
 
-# To let the python app talk to postgres, we create a docker network
+# Create a network so the client container can reach Postgres by name
 docker network create pgnet
 
-# Run the docker container for postgres
+# Start Postgres
 docker run -d --name postgres --network pgnet -e POSTGRES_PASSWORD=secret postgres-17.6:v1
 ```
 
@@ -43,9 +117,7 @@ docker run -d --name postgres --network pgnet -e POSTGRES_PASSWORD=secret postgr
 
 ### Walkthrough
 
-Now that we have the docker containers built, let's begin the walkthrough. 
-
-Let's exec into the postgres image:
+Now that we have the docker containers built, let's begin. Let's exec into the postgres container:
 
 ```bash
 docker exec -it postgres bash
@@ -66,17 +138,17 @@ postgres     399  1.3  0.0   7352  4096 pts/0    Ss   06:51   0:00 bash
 postgres     406  0.0  0.0   9392  4116 pts/0    R+   06:51   0:00 ps aux
 ```
 
-Already a lot seems to be going on, even though we have just freshly started the postgres server. There are several processes already running. We'll get to the other processes later in the series, but for now the most important process for us is the one with PID 1. This is the **postmaster**. When we start postgres, the postmaster process is started. It then spawns the other postgres processes that we see listed above. 
+Already a lot seems to be going on, even though we have just freshly started this container. There are several processes already running. We'll get to the other processes later in the series, but for now the most important process for us is the one with PID 1. This is the **postmaster**. When we start postgres, the postmaster process is started. It then spawns the other postgres processes that we see listed above. 
 
-The postmaster process has a key responsibilty: it runs an infinite loop, waiting for new connections, and "handles" the incoming connections. Of course, there are other things as well that this postmaster process does, but for the purposes of this blog, we'll focus on connection handling. 
+The postmaster process has a key responsibility: it runs an infinite loop, waiting for new connections, and "handles" the incoming connections. Of course, there are other things as well that this postmaster process does, but for the purposes of this blog, we'll focus on connection handling. 
 
-Now, let's try to connect to postgres using the python application. Open a new terminal and run: 
+Now, let's try to connect to postgres using the python application. In a second terminal (outside the container), run: 
 
 ```bash
 docker run --rm --network pgnet pg-client:v1 connect
 ```
 
-This is going to run the python application that will try to connect to the postgres, wait for a few seconds and then shut down. From the postgres server terminal, if we again run `ps aux`, we get a new entry now, the process with PID 432:
+This is going to run the python application that will try to connect to the postgres, hold the connection open for 30 seconds and then close it. From the postgres server terminal, if we again run `ps aux`, we get a new entry now, the process with PID 432:
 
 ```bash
 postgres@0f41997a8b1b:/$ ps aux
@@ -100,6 +172,14 @@ When our python application tried to connect to postgres server, the postmaster 
 - `172.18.0.3(48278)` - the host and port of the python application i.e. the client
 - `idle` - the state of the connection. Currently, the connection is sitting idle, without any work to do. 
 
+We can see the same thing from inside Postgres. There is a view in Postgres called `pg_stat_activity`, which has one row per backend process:
+
+```bash
+psql -U myuser -d mydatabase -c "SELECT pid, usename, datname, client_addr, state FROM pg_stat_activity WHERE backend_type = 'client backend';"
+```
+
+The `pid` column matches the process ID from `ps aux`. You'll also see a second row for the `psql` session we just opened, because it's a connection too, with its own backend process.
+
 If we try to simulate a select query that runs for 30 seconds using:
 
 ```bash
@@ -108,29 +188,52 @@ docker run --rm --network pgnet pg-client:v1 select
 
 we see the state of the connection change from `idle` to `SELECT`. This is postgres indicating to us that the handler process is currently executing a SELECT request sent by the client. 
 
-If we open another terminal and again try to connect to postgres server, we will see another process is being spawned. This is a key point: for every connection, the postgres server is going to have a process handling that connection. This process has its own stack, memory space, and the context switching overhead. At the same time, this process is entirely independent of the postgres server process. If the connection handling process crashes, there is no impact of it on the postgres server- it will continue to function as before.  
+If we open another terminal and again try to connect to postgres server, we will see another process is being spawned. This is a key point: for every connection, the postgres server is going to have a process handling that connection. This process has its own stack, memory space, and the context switching overhead. 
 
-Postgres runs on a multi-process parallelization model. For every new connection, postgres is going to spawn a new process to handle it. When the connection is terminated, the process is also killed. Now, most modern database are not going to follow multi-process model, but rather the multi-threaded model. For each new connection, they're gonna spawn (reuse from the threadpool) some threads. This is lightweight than the process based approach but if not carefully designed, can cause the database to crash. 
+At the same time, this process is independent of the other connections. If it exits or runs into an error, the postgres server continues to function as before. ( Note that a real crash, like a segfault or the Linux OOM killer killing the process, is different: postgres then stops all the processes and restarts. )
+
+Postgres runs on a process-per-connection model. For every new connection, postgres is going to spawn a new process to handle it. When the connection is terminated, the process exits. Now, many modern databases do not follow multi-process model, but rather the multi-threaded model. For each new connection, they're gonna spawn (reuse from the threadpool) some threads. This is lighter than the process based approach but if not carefully designed, can cause the database to crash. 
 
 The multi-process model of postgres has important implications on how we scale postgres.
 
-If we have an application we thousands of users who want to connect to the database, the postgres server is going to end up spawning thousands of processes. This is going to hamper the performance of our database. We simply cannot have a case where are spawning thousands of processes just to handle connections. 
+If we have an application with thousands of users who want to connect to the database, the postgres server is going to end up spawning thousands of processes. This is going to hamper the performance of our database. We simply cannot have a case where we are spawning thousands of processes just to handle connections. 
 
-To get around this, we can do several things. The OpenAI blog post lists a bunch of things they did to scale postgres to serve 800 million users. We'll focus on a couple of them:
+To get around this, we can do several things. The [OpenAI blog post](https://openai.com/index/scaling-postgresql/) lists a bunch of things they did to scale postgres to serve 800 million users. We'll focus on a couple of them:
 
-1. Setting `max_connections` parameter: at the most basic level, we can restrict the number of connections postgres will accept. By default, this is set to 100. After this limit is reached, the clients trying to connect will get an error. This safeguards the postgres server but doesn't serve the clients well. So, we look at the next option.
+1. Setting `max_connections` parameter: at the most basic level, we can restrict the number of connections postgres will accept. By default, this is set to 100. After this limit is reached, the clients trying to connect will get an error. Out of these 100, a few connections (3 by default, set by `superuser_reserved_connections`) are kept aside for superusers, so that an admin can still log in and fix things even when all the other connections are used up. This safeguards the postgres server but doesn't serve the clients well. So, we look at the next option.
 
-2. Using a load balancer like PgBouncer. In such a setup, the clients try to connect to the load balancer and the load balancer maintains a small pool of connections with postgres. As a result, from our application's point of view, there could be thousands of connections but from the point of view of the database, there are only a handful of connections. 
+2. Using a connection pooler like PgBouncer. In such a setup, the clients try to connect to the pooler and the pooler maintains a small pool of connections with postgres. As a result, from our application's point of view, there could be thousands of connections but from the point of view of the database, there are only a handful of connections. 
 
 ---
 
-### Credits and Resources:
+### Source Code Walkthrough
+
+Let's see where this happens in the postgres source code. I'm using the `REL_17_6` branch here, so the line numbers in the links match postgres 17.6.
+
+The postmaster runs an infinite loop called `ServerLoop` in `postmaster.c`. When a new client connects, the loop accepts the connection and calls [`BackendStartup`](https://github.com/postgres/postgres/blob/REL_17_6/src/backend/postmaster/postmaster.c#L3545). This function is called once for every new connection. It does some bookkeeping for the new backend, like generating a cancel key, and then calls [`postmaster_child_launch`](https://github.com/postgres/postgres/blob/REL_17_6/src/backend/postmaster/launch_backend.c#L231).
+
+`postmaster_child_launch` lives in `launch_backend.c`, and this is where the fork actually happens:
+
+```c
+pid = fork_process();
+if (pid == 0)               /* child */
+{
+    /* Close the postmaster's sockets */
+    ClosePostmasterPorts(child_type == B_LOGGER);
+    ...
+```
+
+`fork_process()` is a small wrapper around the `fork()` system call. After the fork, there are two processes running the same code. In the child (`pid == 0`), the first thing it does is close the postmaster's listening sockets, since it doesn't need them. But it keeps the socket for its own client. This is the "copy of the socket" I mentioned earlier: `fork()` copies all the open file descriptors of the parent, so the child gets the client's connection for free.
+
+That's it- one `fork()` per connection. Every backend process we saw in `ps aux` was created here.
+
+---
+
+### Credits and Resources
 
 For this post, I have heavily used Claude Code. Along with that, I have relied on the following resources: 
 
 1. [Intro to Database Systems by CMU](https://15445.courses.cs.cmu.edu/fall2025/) 
-2. [Postgres Source Code](https://github.com/postgres/postgres)
-3. You can also check out the youtube video I made on this post [here](https://youtu.be/iJHdUqGNBlk?si=3dzsBjD1mbFPpQoj). 
- 
-   
+2. [Postgres Source Code](https://github.com/postgres/postgres/tree/REL_17_6)
+
 ---
