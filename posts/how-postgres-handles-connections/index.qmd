@@ -2,6 +2,7 @@
 title: "How Does Postgres Handle Connections?"
 date: "2026-03-15"
 categories: [postgres, internals]
+image: process-per-connection.png
 code-fold: true
 description: "Postgres starts a separate process for every client connection. Here's how that works, why it limits scale, and where it happens in the source code."
 ---

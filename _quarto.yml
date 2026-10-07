@@ -7,6 +7,7 @@ project:
 
 website:
   title: "The WAL Street Journal"
+  favicon: favicon.png
   description: "Database internals, read from the source code. Written companions to the YouTube videos."
   site-url: https://thewalstreetjournal.github.io
   google-analytics: G-NMYW1XQTP9

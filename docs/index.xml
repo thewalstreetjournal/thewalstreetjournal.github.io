@@ -894,6 +894,7 @@ font-style: inherit;">...</span></span></code></pre></div></div>
   <category>internals</category>
   <guid>https://thewalstreetjournal.github.io/posts/how-postgres-handles-connections/</guid>
   <pubDate>Sat, 14 Mar 2026 18:30:00 GMT</pubDate>
+  <media:content url="https://thewalstreetjournal.github.io/posts/how-postgres-handles-connections/process-per-connection.png" medium="image" type="image/png" height="81" width="144"/>
 </item>
 </channel>
 </rss>
