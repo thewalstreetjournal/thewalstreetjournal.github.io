@@ -1,0 +1,559 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss  xmlns:atom="http://www.w3.org/2005/Atom" 
+      xmlns:media="http://search.yahoo.com/mrss/" 
+      xmlns:content="http://purl.org/rss/1.0/modules/content/" 
+      xmlns:dc="http://purl.org/dc/elements/1.1/" 
+      version="2.0">
+<channel>
+<title>The WAL Street Journal</title>
+<link>https://thewalstreetjournal.github.io/</link>
+<atom:link href="https://thewalstreetjournal.github.io/index.xml" rel="self" type="application/rss+xml"/>
+<description>Database internals, read from the source code.</description>
+<generator>quarto-1.8.26</generator>
+<lastBuildDate>Sat, 28 Mar 2026 18:30:00 GMT</lastBuildDate>
+<item>
+  <title>How Does Postgres Store Data?</title>
+  <link>https://thewalstreetjournal.github.io/posts/how-postgres-stores-data/</link>
+  <description><![CDATA[ 
+
+
+
+
+
+
+<section id="how-does-postgres-store-data" class="level1">
+<h1>How Does Postgres Store Data?</h1>
+<p>As we all know, postgres is an awesome, open source database system. In these series of blog posts, I am going to explore some internals of Postgres.</p>
+<p>In this post, we explore how postgres internally organizes and stores data that we expect it to store.</p>
+<hr>
+<section id="prerequisites" class="level2">
+<h2 class="anchored" data-anchor-id="prerequisites">Prerequisites</h2>
+<p>For this ( and subsequent ) posts, I am assuming that the reader:</p>
+<ul>
+<li>Knows what docker containers are, how to build and run them.</li>
+<li>Is familiar with the terms processes, threads, and virtual memory</li>
+</ul>
+<p>For this post, I am using a docker container for postgres and a docker container for a simple application connecting to postgres. Both files can be found here.</p>
+<p>To build the containers, run:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1" style="background: #f1f3f5;"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb1-1"><span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;"># Build the postgres and the python application images</span></span>
+<span id="cb1-2"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">docker</span> build <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-t</span> postgres-17.6:v1 .</span>
+<span id="cb1-3"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">docker</span> build <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-f</span> Dockerfile.client <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-t</span> pg-client:v1 .</span>
+<span id="cb1-4"></span>
+<span id="cb1-5"><span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;"># To let the python app talk to postgres, we create a docker network</span></span>
+<span id="cb1-6"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">docker</span> network create pgnet</span>
+<span id="cb1-7"></span>
+<span id="cb1-8"><span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;"># Run the docker container for postgres</span></span>
+<span id="cb1-9"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">docker</span> run <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-d</span> <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">--name</span> postgres <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">--network</span> pgnet <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-e</span> POSTGRES_PASSWORD=secret postgres-17.6:v1</span>
+<span id="cb1-10"></span>
+<span id="cb1-11"><span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;"># Run the docker container for the python application</span></span></code></pre></div></div>
+<hr>
+</section>
+<section id="storage-in-postgres" class="level2">
+<h2 class="anchored" data-anchor-id="storage-in-postgres">Storage in Postgres</h2>
+<p>Before we start the actual exploration, note that in the Dockerfile, we have created a user <code>myuser</code> and a database <code>mydatabase</code> in our postgres server.</p>
+<p>Now, let’s create a table in our database so that we can insert some data. Let’s exec into the postgres container using:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2" style="background: #f1f3f5;"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb2-1"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">docker</span> exec <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-it</span> postgres bash</span></code></pre></div></div>
+<p>Once inside, we can do: <code>psql -U myuser -d mydatabase</code>. This opens a client connection to <code>mydatabase</code> using <code>myuser</code>. From the postgres server point of view, this is just another connection. Now we can create the table and insert some data as:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3" style="background: #f1f3f5;"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb3-1"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">CREATE</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">TABLE</span> mytable (<span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">id</span> <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">INT</span>, name TEXT);</span>
+<span id="cb3-2"></span>
+<span id="cb3-3"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">INSERT</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">INTO</span> mytable <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">VALUES</span> (<span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">1</span>, <span class="st" style="color: #20794D;
+background-color: null;
+font-style: inherit;">'Alice'</span>);</span></code></pre></div></div>
+<p>We receive a response from the postgres server saying that the insert was successfully done. Postgres has successfully persisted this data onto disk. But what does it mean to “persist data on disk”? At the end of the day, these are simply files! Whatever data we insert is stored in some file, in some directory created by the postgres server.</p>
+<p>We can do <code>SHOW data_directory;</code> to get the directory path where the data files are stored. I see <code>/var/lib/postgresql/data</code> as the output. On most Linux/Docker based containers, this is going to be the path unless configured differently. Let’s get into this directory and see what’s there:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4" style="background: #f1f3f5;"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb4-1"><span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;"># First close the client connection and get out of psql</span></span>
+<span id="cb4-2"><span class="bu" style="color: null;
+background-color: null;
+font-style: inherit;">exit</span></span>
+<span id="cb4-3"></span>
+<span id="cb4-4"><span class="bu" style="color: null;
+background-color: null;
+font-style: inherit;">cd</span> /var/lib/postgresql/data</span>
+<span id="cb4-5"><span class="fu" style="color: #4758AB;
+background-color: null;
+font-style: inherit;">ls</span> <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-l</span></span></code></pre></div></div>
+<p>We see the following output:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5" style="background: #f1f3f5;"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb5-1"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres@7997d00b7436:~/data$</span> ls <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-l</span></span>
+<span id="cb5-2"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">total</span> 128</span>
+<span id="cb5-3"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 6 postgres postgres  4096 Mar 14 13:05 base</span>
+<span id="cb5-4"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 global</span>
+<span id="cb5-5"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_commit_ts</span>
+<span id="cb5-6"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_dynshmem</span>
+<span id="cb5-7"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">-rw-------</span> 1 postgres postgres  5743 Mar 14 13:05 pg_hba.conf</span>
+<span id="cb5-8"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">-rw-------</span> 1 postgres postgres  2640 Mar 14 13:05 pg_ident.conf</span>
+<span id="cb5-9"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 4 postgres postgres  4096 Mar 14 13:05 pg_logical</span>
+<span id="cb5-10"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 4 postgres postgres  4096 Mar 14 13:05 pg_multixact</span>
+<span id="cb5-11"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_notify</span>
+<span id="cb5-12"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_replslot</span>
+<span id="cb5-13"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_serial</span>
+<span id="cb5-14"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_snapshots</span>
+<span id="cb5-15"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_stat</span>
+<span id="cb5-16"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_stat_tmp</span>
+<span id="cb5-17"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_subtrans</span>
+<span id="cb5-18"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_tblspc</span>
+<span id="cb5-19"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_twophase</span>
+<span id="cb5-20"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">-rw-------</span> 1 postgres postgres     3 Mar 14 13:05 PG_VERSION</span>
+<span id="cb5-21"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 4 postgres postgres  4096 Mar 14 13:05 pg_wal</span>
+<span id="cb5-22"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_xact</span>
+<span id="cb5-23"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">-rw-------</span> 1 postgres postgres    88 Mar 14 13:05 postgresql.auto.conf</span>
+<span id="cb5-24"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">-rw-------</span> 1 postgres postgres 30777 Mar 14 13:05 postgresql.conf</span>
+<span id="cb5-25"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">-rw-------</span> 1 postgres postgres    36 Mar 14 13:05 postmaster.opts</span>
+<span id="cb5-26"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">-rw-------</span> 1 postgres postgres    94 Mar 14 13:05 postmaster.pid</span></code></pre></div></div>
+<p>Already we see there are some files and directories present in this. You can check what these files contain by doing: <code>cat &lt;filename&gt;</code>. Mostly these are configuration files that we’re not going to get into now. We’re also not going to touch any other directories than <code>base</code>. Each is a separate blog post on its own!</p>
+<p>If we do, <code>cd /base/ &amp;&amp; ls -l</code>, we see several subdirectories named after some numbers:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6" style="background: #f1f3f5;"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb6-1"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres@7997d00b7436:~/data$</span> cd base/ <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">&amp;&amp;</span> <span class="fu" style="color: #4758AB;
+background-color: null;
+font-style: inherit;">ls</span> <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-l</span></span>
+<span id="cb6-2"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">total</span> 16</span>
+<span id="cb6-3"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 2 postgres postgres 4096 Mar 14 13:08 1</span>
+<span id="cb6-4"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 2 postgres postgres 4096 Mar 14 13:05 16385</span>
+<span id="cb6-5"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 2 postgres postgres 4096 Mar 14 13:05 4</span>
+<span id="cb6-6"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">drwx------</span> 2 postgres postgres 4096 Mar 14 13:07 5</span></code></pre></div></div>
+<p>These numbers are called Object IDs or OIDs in Postgres. Every object that postgres creates- table, index, function, role, database, anything - gets an OID. These subdirectories are data directories for each of the database that we have in our postgres server. There are some default databases and there is one database that we have created.</p>
+<p>Each of these directories are going to contain some files containing the data of the tables in the database and some files for additional metadata for efficiency. Let’s find out which of these directories is for <code>mydatabase</code>.</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb7" style="background: #f1f3f5;"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb7-1"><span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;"># Connect to postgres server as a client</span></span>
+<span id="cb7-2"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">psql</span> <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-U</span> myuser <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-d</span> mydatabase</span>
+<span id="cb7-3"></span>
+<span id="cb7-4"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">SELECT</span> oid, datname FROM pg_database<span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">;</span></span></code></pre></div></div>
+<p>I see that <code>mydatabase</code> has an OID of 16385. This number might be different for you. There are other default and template databases as well, which we don’t have to worry about for now. <code>exit</code> this connection.</p>
+<p>Now, we can <code>cd</code> into the directory for our database and see what’s present there.</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb8" style="background: #f1f3f5;"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb8-1"><span class="bu" style="color: null;
+background-color: null;
+font-style: inherit;">cd</span> 16385/ <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">&amp;&amp;</span> <span class="fu" style="color: #4758AB;
+background-color: null;
+font-style: inherit;">ls</span></span></code></pre></div></div>
+<p>Whoa! We have just one table with just one row in <code>mydatabase</code> yet there are about 300 files present in this directory. These are mostly system catalogs that postgres cloned from the template database.</p>
+<p>Now, let’s try to find the file for our table.</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb9" style="background: #f1f3f5;"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb9-1"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">select</span> relname, relfilenode, reltablespace <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">from</span> pg_class <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">where</span> relname <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> <span class="st" style="color: #20794D;
+background-color: null;
+font-style: inherit;">'mytable'</span>;</span></code></pre></div></div>
+<p>We see the output as:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb10" style="background: #f1f3f5;"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb10-1"> relname | relfilenode | reltablespace </span>
+<span id="cb10-2"><span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">---------+-------------+---------------</span></span>
+<span id="cb10-3"> mytable |       <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">16390</span> |             <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">0</span></span></code></pre></div></div>
+<p>The <code>relfilenode</code> is the file name for our table. If we go back to the data directory, the file 16390 contains the data that we inserted. But this is a binary file. At times, databases will apply some encoding or compression while storing data in files. As a result, the files are not directly readable- we can’t simply do <code>cat &lt;filename&gt;</code> and expect to read the entire contents. So how can we understand this data file and the file structure?</p>
+<p>When postgres stores data, it doesn’t store one row or a few bytes. It thinks in terms of “pages” or “blocks”. Each block is given a fixed size of 8KB by default, though we can change this while setting up postgres. A file is made up of one or more such blocks. Naturally, it implies that size of each file will be in multiple of 8KB. Any data file of any database (even the system catalogs) are organized into blocks.</p>
+<p>We can see that there seem to be several different files here- these are called “forks”. Each relation (i.e.&nbsp;table) can have upto four “forks”: | File | Fork | Purpose | |——|——|———| | <code>{filenode}</code> | main | Actual row data | | <code>{filenode}_fsm</code> | FSM | Free Space Map — tracks available space per page. Used for efficiency | | <code>{filenode}_vm</code> | VM | Visibility Map — tracks per-page visibility and freeze status. Used for concurrency control | | <code>{filenode}_init</code> | init | Unlogged tables/indexes only — template for reset after crash |</p>
+<p>We can list the binary contents of the <code>16390</code> file by doing <code>hexdump 16390</code>. This isn’t very helpful ofcourse since it’s binary, but observe that at the beginning there are a few bytes written and there are a few bytes written at the end. We can decode this binary dump to see if we can interpret this.</p>
+<p>The structure of a postgres data file looks something like the following:</p>
+<!-- TODO: Insert the image of a segment files containing several pages -->
+<p>As we can see, the table’s data is broken into “segments” of size 1GB ( this too is configurable ). For our table, if we had 4GB of data, the segment files will be named as: <code>16390</code>, <code>16390.1</code>, <code>16390.2</code>, and <code>16390.3</code>. Each segment file is made of one or more blocks. Each block has some headers, a slot array, and the rows. First block of a segment has some special headers as well. The slot array tells the offset for a row within the block. The slot array grows from the top while the rows grow from the bottom. The space in between them is the “free space” where new inserts can go.</p>
+<p>Now that we know how the data is organized in a segment file, let’s see if we can interpret it. We won’t get into headers that much, but rather focus on the ItemIdData array and the tuple data.</p>
+<hr>
+</section>
+<section id="credits-and-resources" class="level2">
+<h2 class="anchored" data-anchor-id="credits-and-resources">Credits and Resources:</h2>
+<p>For this post, I have heavily used Claude Code. Along with that, I have relied on the following resources:</p>
+<ol type="1">
+<li><a href="">Intro to Database Systems, CMU</a></li>
+<li><a href="">PostgreSQL Source Code</a></li>
+</ol>
+<hr>
+
+
+</section>
+</section>
+
+ ]]></description>
+  <category>postgres</category>
+  <category>internals</category>
+  <guid>https://thewalstreetjournal.github.io/posts/how-postgres-stores-data/</guid>
+  <pubDate>Sat, 28 Mar 2026 18:30:00 GMT</pubDate>
+</item>
+<item>
+  <title>How Does Postgres Handle Connections?</title>
+  <link>https://thewalstreetjournal.github.io/posts/how-postgres-handles-connections/</link>
+  <description><![CDATA[ 
+
+
+
+
+
+
+<p>Postgres works on a client-server model. There is a Postgres server that is running an infinite loop listening for new, incoming requests. Clients wanting to interact with Postgres connect with this server.</p>
+<section id="how-does-postgres-handle-connections" class="level1">
+<h1>How Does Postgres Handle Connections?</h1>
+<p>As we all know, postgres is an awesome, open source database system. In these series of blog posts, I am going to explore some internals of Postgres.</p>
+<p>In this blog, we explore how postgres handles incoming connections and what implications it has for performance and scale. We’ll try to do a walkthrough of this using a postgres container and exploring some of the postgres source code.</p>
+<hr>
+<section id="prerequisites" class="level3">
+<h3 class="anchored" data-anchor-id="prerequisites">Prerequisites</h3>
+<p>For this ( and subsequent ) posts, I am assuming that the reader:</p>
+<ul>
+<li>Knows what docker containers are, how to build and run them.</li>
+<li>Is familiar with the terms processes and threads</li>
+</ul>
+<p>For this post, I am using a docker container for postgres and a docker container for a simple application connecting to postgres. Both files can be found here.</p>
+<p>To build the containers, run:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1" style="background: #f1f3f5;"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb1-1"><span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;"># Build the postgres and the python application images</span></span>
+<span id="cb1-2"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">docker</span> build <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-t</span> postgres-17.6:v1 .</span>
+<span id="cb1-3"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">docker</span> build <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-f</span> Dockerfile.client <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-t</span> pg-client:v1 .</span>
+<span id="cb1-4"></span>
+<span id="cb1-5"><span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;"># To let the python app talk to postgres, we create a docker network</span></span>
+<span id="cb1-6"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">docker</span> network create pgnet</span>
+<span id="cb1-7"></span>
+<span id="cb1-8"><span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;"># Run the docker container for postgres</span></span>
+<span id="cb1-9"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">docker</span> run <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-d</span> <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">--name</span> postgres <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">--network</span> pgnet <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-e</span> POSTGRES_PASSWORD=secret postgres-17.6:v1</span></code></pre></div></div>
+<hr>
+</section>
+<section id="walkthrough" class="level3">
+<h3 class="anchored" data-anchor-id="walkthrough">Walkthrough</h3>
+<p>Now that we have the docker containers built, let’s begin the walkthrough.</p>
+<p>Let’s exec into the postgres image:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2" style="background: #f1f3f5;"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb2-1"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">docker</span> exec <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-it</span> postgres bash</span></code></pre></div></div>
+<p>Once inside, we can list all the processes running in our container by doing <code>ps aux</code>. We get the following output:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3" style="background: #f1f3f5;"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb3-1"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres@0f41997a8b1b:/$</span> ps aux</span>
+<span id="cb3-2"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">USER</span>         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND</span>
+<span id="cb3-3"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres</span>       1  0.0  0.1 217536 28556 <span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">?</span>        Ss   Mar12   0:00 postgres</span>
+<span id="cb3-4"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres</span>      49  0.0  0.0 217668 10088 <span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">?</span>        Ss   Mar12   0:00 postgres: checkpointer </span>
+<span id="cb3-5"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres</span>      50  0.0  0.0 217692  7436 <span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">?</span>        Ss   Mar12   0:00 postgres: background writer </span>
+<span id="cb3-6"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres</span>      52  0.0  0.0 217536 10264 <span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">?</span>        Ss   Mar12   0:00 postgres: walwriter </span>
+<span id="cb3-7"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres</span>      53  0.0  0.0 219112  9136 <span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">?</span>        Ss   Mar12   0:00 postgres: autovacuum launcher </span>
+<span id="cb3-8"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres</span>      54  0.0  0.0 219120  8276 <span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">?</span>        Ss   Mar12   0:00 postgres: logical replication launcher </span>
+<span id="cb3-9"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres</span>     399  1.3  0.0   7352  4096 pts/0    Ss   06:51   0:00 bash</span>
+<span id="cb3-10"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres</span>     406  0.0  0.0   9392  4116 pts/0    R+   06:51   0:00 ps aux</span></code></pre></div></div>
+<p>Already a lot seems to be going on, even though we have just freshly started the postgres server. There are several processes already running. We’ll get to the other processes later in the series, but for now the most important process for us is the one with PID 1. This is the <strong>postmaster</strong>. When we start postgres, the postmaster process is started. It then spawns the other postgres processes that we see listed above.</p>
+<p>The postmaster process has a key responsibilty: it runs an infinite loop, waiting for new connections, and “handles” the incoming connections. Of course, there are other things as well that this postmaster process does, but for the purposes of this blog, we’ll focus on connection handling.</p>
+<p>Now, let’s try to connect to postgres using the python application. Open a new terminal and run:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4" style="background: #f1f3f5;"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb4-1"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">docker</span> run <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">--rm</span> <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">--network</span> pgnet pg-client:v1 connect</span></code></pre></div></div>
+<p>This is going to run the python application that will try to connect to the postgres, wait for a few seconds and then shut down. From the postgres server terminal, if we again run <code>ps aux</code>, we get a new entry now, the process with PID 432:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5" style="background: #f1f3f5;"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb5-1"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres@0f41997a8b1b:/$</span> ps aux</span>
+<span id="cb5-2"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">USER</span>         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND</span>
+<span id="cb5-3"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres</span>       1  0.0  0.1 217536 28556 <span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">?</span>        Ss   Mar12   0:00 postgres</span>
+<span id="cb5-4"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres</span>      49  0.0  0.0 217668 10088 <span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">?</span>        Ss   Mar12   0:00 postgres: checkpointer </span>
+<span id="cb5-5"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres</span>      50  0.0  0.0 217692  7436 <span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">?</span>        Ss   Mar12   0:00 postgres: background writer </span>
+<span id="cb5-6"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres</span>      52  0.0  0.0 217536 10264 <span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">?</span>        Ss   Mar12   0:00 postgres: walwriter </span>
+<span id="cb5-7"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres</span>      53  0.0  0.0 219112  9136 <span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">?</span>        Ss   Mar12   0:00 postgres: autovacuum launcher </span>
+<span id="cb5-8"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres</span>      54  0.0  0.0 219120  8276 <span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">?</span>        Ss   Mar12   0:00 postgres: logical replication launcher </span>
+<span id="cb5-9"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres</span>     426  0.6  0.0   7352  4060 pts/0    Ss   06:57   0:00 bash</span>
+<span id="cb5-10"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres</span>     432  0.0  0.0 219648 12960 <span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">?</span>        Ss   06:57   0:00 postgres: myuser mydatabase 172.18.0.3<span class="er" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">(</span><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">48278</span><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">)</span> <span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">idle</span></span>
+<span id="cb5-11"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">postgres</span>     433  0.0  0.0   9392  4136 pts/0    R+   06:57   0:00 ps aux</span></code></pre></div></div>
+<p>When our python application tried to connect to postgres server, the postmaster process jumped to action and created a new process to handle that connection request. From the name of the process, we can interpret a few things:</p>
+<ul>
+<li><code>postgres:</code> - this is the prefix attached to all the processes spawned by postmaster</li>
+<li><code>myuser</code> - the name of the user that connected to postgres</li>
+<li><code>mydatabase</code> - the name of the database to which the user connected</li>
+<li><code>172.18.0.3(48278)</code> - the host and port of the python application i.e.&nbsp;the client</li>
+<li><code>idle</code> - the state of the connection. Currently, the connection is sitting idle, without any work to do.</li>
+</ul>
+<p>If we try to simulate a select query that runs for 30 seconds using:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6" style="background: #f1f3f5;"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb6-1"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">docker</span> run <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">--rm</span> <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">--network</span> pgnet pg-client:v1 select</span></code></pre></div></div>
+<p>we see the state of the connection change from <code>idle</code> to <code>SELECT</code>. This is postgres indicating to us that the handler process is currently executing a SELECT request sent by the client.</p>
+<p>If we open another terminal and again try to connect to postgres server, we will see another process is being spawned. This is a key point: for every connection, the postgres server is going to have a process handling that connection. This process has its own stack, memory space, and the context switching overhead. At the same time, this process is entirely independent of the postgres server process. If the connection handling process crashes, there is no impact of it on the postgres server- it will continue to function as before.</p>
+<p>Postgres runs on a multi-process parallelization model. For every new connection, postgres is going to spawn a new process to handle it. When the connection is terminated, the process is also killed. Now, most modern database are not going to follow multi-process model, but rather the multi-threaded model. For each new connection, they’re gonna spawn (reuse from the threadpool) some threads. This is lightweight than the process based approach but if not carefully designed, can cause the database to crash.</p>
+<p>The multi-process model of postgres has important implications on how we scale postgres.</p>
+<p>If we have an application we thousands of users who want to connect to the database, the postgres server is going to end up spawning thousands of processes. This is going to hamper the performance of our database. We simply cannot have a case where are spawning thousands of processes just to handle connections.</p>
+<p>To get around this, we can do several things. The OpenAI blog post lists a bunch of things they did to scale postgres to serve 800 million users. We’ll focus on a couple of them:</p>
+<ol type="1">
+<li><p>Setting <code>max_connections</code> parameter: at the most basic level, we can restrict the number of connections postgres will accept. By default, this is set to 100. After this limit is reached, the clients trying to connect will get an error. This safeguards the postgres server but doesn’t serve the clients well. So, we look at the next option.</p></li>
+<li><p>Using a load balancer like PgBouncer. In such a setup, the clients try to connect to the load balancer and the load balancer maintains a small pool of connections with postgres. As a result, from our application’s point of view, there could be thousands of connections but from the point of view of the database, there are only a handful of connections.</p></li>
+</ol>
+<hr>
+</section>
+<section id="credits-and-resources" class="level3">
+<h3 class="anchored" data-anchor-id="credits-and-resources">Credits and Resources:</h3>
+<p>For this post, I have heavily used Claude Code. Along with that, I have relied on the following resources:</p>
+<ol type="1">
+<li><a href="https://15445.courses.cs.cmu.edu/fall2025/">Intro to Database Systems by CMU</a></li>
+<li><a href="https://github.com/postgres/postgres">Postgres Source Code</a></li>
+<li>You can also check out the youtube video I made on this post <a href="https://youtu.be/iJHdUqGNBlk?si=3dzsBjD1mbFPpQoj">here</a>.</li>
+</ol>
+<hr>
+
+
+</section>
+</section>
+
+ ]]></description>
+  <category>postgres</category>
+  <category>internals</category>
+  <guid>https://thewalstreetjournal.github.io/posts/how-postgres-handles-connections/</guid>
+  <pubDate>Sat, 14 Mar 2026 18:30:00 GMT</pubDate>
+</item>
+</channel>
+</rss>

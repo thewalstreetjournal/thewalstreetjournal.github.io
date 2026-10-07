@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>https://thewalstreetjournal.github.io/posts/how-postgres-stores-data/index.html</loc>
+    <lastmod>2026-10-07T18:21:12.255Z</lastmod>
+  </url>
+  <url>
+    <loc>https://thewalstreetjournal.github.io/index.html</loc>
+    <lastmod>2026-10-07T18:10:03.417Z</lastmod>
+  </url>
+  <url>
+    <loc>https://thewalstreetjournal.github.io/about.html</loc>
+    <lastmod>2026-10-07T18:18:13.230Z</lastmod>
+  </url>
+  <url>
+    <loc>https://thewalstreetjournal.github.io/posts/how-postgres-handles-connections/index.html</loc>
+    <lastmod>2026-10-07T18:21:11.794Z</lastmod>
+  </url>
+</urlset>

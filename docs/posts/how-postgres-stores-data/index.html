@@ -6,7 +6,7 @@
 
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
 
-<meta name="dcterms.date" content="2026-03-15">
+<meta name="dcterms.date" content="2026-03-29">
 <meta name="description" content="Data stored in postgres is persisted on disk. But how exactly? In this blog post, we explore how postgres stores data on disk.">
 
 <title>How Does Postgres Store Data? – The WAL Street Journal</title>
@@ -109,14 +109,14 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
     "search-label": "Search"
   }
 }</script>
-<script async="" src="https://www.googletagmanager.com/gtag/js?id=G-CKDPXJ4Y38"></script>
+<script async="" src="https://www.googletagmanager.com/gtag/js?id=G-NMYW1XQTP9"></script>
 
 <script type="text/javascript">
 
 window.dataLayer = window.dataLayer || [];
 function gtag(){dataLayer.push(arguments);}
 gtag('js', new Date());
-gtag('config', 'G-CKDPXJ4Y38', { 'anonymize_ip': true});
+gtag('config', 'G-NMYW1XQTP9', { 'anonymize_ip': true});
 </script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
@@ -124,6 +124,12 @@ gtag('config', 'G-CKDPXJ4Y38', { 'anonymize_ip': true});
 
 
 <link rel="stylesheet" href="../../styles.css">
+<meta property="og:title" content="How Does Postgres Store Data? – The WAL Street Journal">
+<meta property="og:description" content="Data stored in postgres is persisted on disk. But how exactly? In this blog post, we explore how postgres stores data on disk.">
+<meta property="og:site_name" content="The WAL Street Journal">
+<meta name="twitter:title" content="How Does Postgres Store Data? – The WAL Street Journal">
+<meta name="twitter:description" content="Data stored in postgres is persisted on disk. But how exactly? In this blog post, we explore how postgres stores data on disk.">
+<meta name="twitter:card" content="summary">
 </head>
 
 <body class="nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
@@ -325,6 +331,11 @@ gtag('config', 'G-CKDPXJ4Y38', { 'anonymize_ip': true});
 </i> 
 <span class="menu-text"></span></a>
   </li>  
+  <li class="nav-item compact">
+    <a class="nav-link" href="../../index.xml"> <i class="bi bi-rss" role="img">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
 </ul>
           </div> <!-- /navcollapse -->
             <div class="quarto-navbar-tools">
@@ -343,7 +354,11 @@ gtag('config', 'G-CKDPXJ4Y38', { 'anonymize_ip': true});
           Data stored in postgres is persisted on disk. But how exactly? In this blog post, we explore how postgres stores data on disk.
         </div>
       </div>
-                </div>
+                          <div class="quarto-categories">
+                <div class="quarto-category">postgres</div>
+                <div class="quarto-category">internals</div>
+              </div>
+                  </div>
   </div>
     
   
@@ -353,7 +368,7 @@ gtag('config', 'G-CKDPXJ4Y38', { 'anonymize_ip': true});
       <div>
       <div class="quarto-title-meta-heading">Published</div>
       <div class="quarto-title-meta-contents">
-        <p class="date">March 15, 2026</p>
+        <p class="date">March 29, 2026</p>
       </div>
     </div>
     
@@ -396,7 +411,7 @@ gtag('config', 'G-CKDPXJ4Y38', { 'anonymize_ip': true});
 <p>For this ( and subsequent ) posts, I am assuming that the reader:</p>
 <ul>
 <li>Knows what docker containers are, how to build and run them.</li>
-<li>Is familiar with the terms processes and threads</li>
+<li>Is familiar with the terms processes, threads, and virtual memory</li>
 </ul>
 <p>For this post, I am using a docker container for postgres and a docker container for a simple application connecting to postgres. Both files can be found here.</p>
 <p>To build the containers, run:</p>
@@ -590,7 +605,7 @@ gtag('config', 'G-CKDPXJ4Y38', { 'anonymize_ip': true});
     }
       var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
       var mailtoRegex = new RegExp(/^mailto:/);
-        var filterRegex = new RegExp('/' + window.location.host + '/');
+        var filterRegex = new RegExp("https:\/\/thewalstreetjournal\.github\.io");
       var isInternal = (href) => {
           return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
       }

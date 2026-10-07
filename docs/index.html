@@ -6,6 +6,7 @@
 
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
 
+<meta name="description" content="Database internals, read from the source code.">
 
 <title>The WAL Street Journal</title>
 <style>
@@ -103,14 +104,14 @@ ul.task-list li input[type="checkbox"] {
     }
   })
   </script>
-<script async="" src="https://www.googletagmanager.com/gtag/js?id=G-CKDPXJ4Y38"></script>
+<script async="" src="https://www.googletagmanager.com/gtag/js?id=G-NMYW1XQTP9"></script>
 
 <script type="text/javascript">
 
 window.dataLayer = window.dataLayer || [];
 function gtag(){dataLayer.push(arguments);}
 gtag('js', new Date());
-gtag('config', 'G-CKDPXJ4Y38', { 'anonymize_ip': true});
+gtag('config', 'G-NMYW1XQTP9', { 'anonymize_ip': true});
 </script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
@@ -147,6 +148,12 @@ window.Quarto = {
 </script>
 
 <link rel="stylesheet" href="styles.css">
+<link rel="alternate" type="application/rss+xml" title="The WAL Street Journal" href="index.xml" data-external="1"><meta property="og:title" content="The WAL Street Journal">
+<meta property="og:description" content="Database internals, read from the source code.">
+<meta property="og:site_name" content="The WAL Street Journal">
+<meta name="twitter:title" content="The WAL Street Journal">
+<meta name="twitter:description" content="Database internals, read from the source code.">
+<meta name="twitter:card" content="summary">
 </head>
 
 <body class="nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
@@ -348,6 +355,11 @@ window.Quarto = {
 </i> 
 <span class="menu-text"></span></a>
   </li>  
+  <li class="nav-item compact">
+    <a class="nav-link" href="./index.xml"> <i class="bi bi-rss" role="img">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
 </ul>
           </div> <!-- /navcollapse -->
             <div class="quarto-navbar-tools">
@@ -357,14 +369,36 @@ window.Quarto = {
     </nav>
 </header>
 <!-- content -->
-<header id="title-block-header" class="quarto-title-block"></header><div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-full page-navbar">
+<header id="title-block-header" class="quarto-title-block default page-columns page-full">
+  <div class="quarto-title-banner page-columns page-full">
+    <div class="quarto-title column-page-left">
+      <h1 class="title">The WAL Street Journal</h1>
+                  <div>
+        <div class="description">
+          Database internals, read from the source code.
+        </div>
+      </div>
+                </div>
+  </div>
+    
+  
+  <div class="quarto-title-meta column-page-left">
+
+      
+    
+      
+    </div>
+    
+  
+  </header><div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-full page-navbar">
 <!-- sidebar -->
 <!-- margin-sidebar -->
     <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
         
-    <h5 class="quarto-listing-category-title">Categories</h5><div class="quarto-listing-category category-default"><div class="category" data-category="">All <span class="quarto-category-count">(2)</span></div></div></div>
+    <h5 class="quarto-listing-category-title">Categories</h5><div class="quarto-listing-category category-default"><div class="category" data-category="">All <span class="quarto-category-count">(2)</span></div><div class="category" data-category="aW50ZXJuYWxz">internals <span class="quarto-category-count">(2)</span></div><div class="category" data-category="cG9zdGdyZXM=">postgres <span class="quarto-category-count">(2)</span></div></div></div>
 <!-- main -->
 <main class="content quarto-banner-title-block column-page-left" id="quarto-document-content">
+
 
 
 
@@ -398,7 +432,7 @@ window.Quarto = {
     </div>
 </div>
 <div class="list quarto-listing-default">
-<div class="quarto-post image-right" data-index="0" data-listing-date-sort="1773513000000" data-listing-file-modified-sort="1773557293794" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="8" data-listing-word-count-sort="1490">
+<div class="quarto-post image-right" data-index="0" data-categories="cG9zdGdyZXMlMkNpbnRlcm5hbHM=" data-listing-date-sort="1774722600000" data-listing-file-modified-sort="1791397272255" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="8" data-listing-word-count-sort="1492">
 <div class="thumbnail"><a href="./posts/how-postgres-stores-data/index.html" class="no-external">
 
 <div class="listing-item-img-placeholder card-img-top" >&nbsp;</div>
@@ -408,6 +442,13 @@ window.Quarto = {
 <h3 class="no-anchor listing-title">
 <a href="./posts/how-postgres-stores-data/index.html" class="no-external">How Does Postgres Store Data?</a>
 </h3>
+<div class="listing-categories">
+
+<div class="listing-category" onclick="window.quartoListingCategory('cG9zdGdyZXM='); return false;">postgres</div>
+
+<div class="listing-category" onclick="window.quartoListingCategory('aW50ZXJuYWxz'); return false;">internals</div>
+
+</div>
 <div class="delink listing-description"><a href="./posts/how-postgres-stores-data/index.html" class="no-external">
 <p>Data stored in postgres is persisted on disk. But how exactly? In this blog post, we explore how postgres stores data on disk.</p>
 </a></div>
@@ -415,13 +456,13 @@ window.Quarto = {
 <div class="metadata">
 <a href="./posts/how-postgres-stores-data/index.html" class="no-external">
 <div class="listing-date">
-Mar 15, 2026
+Mar 29, 2026
 </div>
 <div class="listing-reading-time">8 min</div>
 </a>
 </div>
 </div>
-<div class="quarto-post image-right" data-index="1" data-listing-date-sort="1773513000000" data-listing-file-modified-sort="1774795069401" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="8" data-listing-word-count-sort="1583">
+<div class="quarto-post image-right" data-index="1" data-categories="cG9zdGdyZXMlMkNpbnRlcm5hbHM=" data-listing-date-sort="1773513000000" data-listing-file-modified-sort="1791397271794" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="9" data-listing-word-count-sort="1614">
 <div class="thumbnail"><a href="./posts/how-postgres-handles-connections/index.html" class="no-external">
 
 <div class="listing-item-img-placeholder card-img-top" >&nbsp;</div>
@@ -431,8 +472,15 @@ Mar 15, 2026
 <h3 class="no-anchor listing-title">
 <a href="./posts/how-postgres-handles-connections/index.html" class="no-external">How Does Postgres Handle Connections?</a>
 </h3>
+<div class="listing-categories">
+
+<div class="listing-category" onclick="window.quartoListingCategory('cG9zdGdyZXM='); return false;">postgres</div>
+
+<div class="listing-category" onclick="window.quartoListingCategory('aW50ZXJuYWxz'); return false;">internals</div>
+
+</div>
 <div class="delink listing-description"><a href="./posts/how-postgres-handles-connections/index.html" class="no-external">
-<p>Recently, OpenAI published a blog on how they scaled Postgres for 800M users. In this blog, we begin to explore the internals of postgres- starting with how postgres handles incoming connections.</p>
+<p>In production environments, there could be hundreds of clients wanting to connect and interact with Postgres. In this post, we see how Postgres handles concurrent connections.</p>
 </a></div>
 </div>
 <div class="metadata">
@@ -440,7 +488,7 @@ Mar 15, 2026
 <div class="listing-date">
 Mar 15, 2026
 </div>
-<div class="listing-reading-time">8 min</div>
+<div class="listing-reading-time">9 min</div>
 </a>
 </div>
 </div>
@@ -533,7 +581,7 @@ Mar 15, 2026
     }
       var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
       var mailtoRegex = new RegExp(/^mailto:/);
-        var filterRegex = new RegExp('/' + window.location.host + '/');
+        var filterRegex = new RegExp("https:\/\/thewalstreetjournal\.github\.io");
       var isInternal = (href) => {
           return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
       }

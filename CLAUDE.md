@@ -1,10 +1,10 @@
-# CLAUDE.md
+# The WAL Street Journal: Blog
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This repository is the blog for The WAL Street Journal. Refer to the parent directory's `CLAUDE.md` for details.
 
 ## Project Overview
 
-Personal blog and portfolio website built with **Quarto**, deployed to GitHub Pages from the `docs/` directory. The site includes blog posts around databases.
+This blog covers database internals, read from the source code. There typically is a YouTube video for each blog post.
 
 ## Build Commands
 
@@ -18,8 +18,6 @@ quarto preview
 # Render a single post/page
 quarto render posts/my-post/index.qmd
 ```
-
-There is no package.json, Makefile, or test suite. Quarto is the sole build tool.
 
 ## Architecture
 
@@ -53,6 +51,7 @@ A new blog post is a directory under `posts/` containing an `index.qmd` with thi
 title: "Post Title"
 date: "YYYY-MM-DD"
 description: "Brief description"
+categories: [postgres, internals]
 ---
 ```
 

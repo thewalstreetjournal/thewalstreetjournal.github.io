@@ -2,4 +2,28 @@
 title: "About"
 ---
 
-I write about databases.
+I read database source code and write about what I find.
+
+Right now that's mostly PostgreSQL and ClickHouse. I'm trying to explore more OLAP databases going forward. Typically, I put a video on my [YouTube channel](https://www.youtube.com/@TheWALStreetJournal), for each blog post.
+
+## Get new posts by email
+
+One email when a new post or video is out. Nothing else.
+
+```{=html}
+<form action="https://buttondown.com/api/emails/embed-subscribe/thewalstreetjournal"
+      method="post" target="popupwindow"
+      onsubmit="window.open('https://buttondown.com/thewalstreetjournal', 'popupwindow')"
+      class="embeddable-buttondown-form">
+  <div class="input-group" style="max-width: 420px;">
+    <input type="email" name="email" class="form-control"
+           placeholder="you@example.com" aria-label="Email address" required>
+    <button type="submit" class="btn btn-primary">Subscribe</button>
+  </div>
+</form>
+```
+
+## Contact
+
+For feedback, corrections, or sponsorship enquiries: **thewalstreetjournal@gmail.com**
+

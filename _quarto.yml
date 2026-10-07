@@ -1,36 +1,43 @@
 project:
   type: website
   output-dir: docs
+  # Only .qmd files become pages. Keeps CLAUDE.md and other notes off the public site.
+  render:
+    - "*.qmd"
 
 website:
   title: "The WAL Street Journal"
-  google-analytics: G-CKDPXJ4Y38
+  description: "Database internals, read from the source code. Written companions to the YouTube videos."
+  site-url: https://thewalstreetjournal.github.io
+  google-analytics: G-NMYW1XQTP9
+  open-graph: true
+  twitter-card: true
   navbar:
     right:
       - icon: github
         href: https://github.com/thewalstreetjournal
       - icon: youtube
         href: https://www.youtube.com/@TheWALStreetJournal
+      - icon: rss
+        href: index.xml
     left:
       - href: index.qmd
         text: Blog
       - href: about.qmd
         text: About
-        
+
 format:
   html:
-    theme: 
+    theme:
       light: flatly
-      dark: darkly 
+      dark: darkly
     css: styles.css
     toc: true
     header-includes: |
       <link rel="preconnect" href="https://fonts.googleapis.com">
       <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
       <link href="https://fonts.googleapis.com/css2?family=Sofia&family=Playfair+Display:wght@700&display=swap" rel="stylesheet">
-    include-after-body: 
-      text: | 
+    include-after-body:
+      text: |
         <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.js"></script>
         <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
-
-

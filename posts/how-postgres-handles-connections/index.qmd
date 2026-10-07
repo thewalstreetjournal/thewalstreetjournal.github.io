@@ -1,9 +1,12 @@
 ---
 title: "How Does Postgres Handle Connections?"
 date: "2026-03-15"
+categories: [postgres, internals]
 code-fold: true
-description: "Recently, OpenAI published a blog on how they scaled Postgres for 800M users. In this blog, we begin to explore the internals of postgres- starting with how postgres handles incoming connections."
+description: "In production environments, there could be hundreds of clients wanting to connect and interact with Postgres. In this post, we see how Postgres handles concurrent connections."
 ---
+
+Postgres works on a client-server model. There is a Postgres server that is running an infinite loop listening for new, incoming requests. Clients wanting to interact with Postgres connect with this server.
 
 # How Does Postgres Handle Connections?
 
