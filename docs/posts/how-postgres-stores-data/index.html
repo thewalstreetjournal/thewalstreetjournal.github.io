@@ -7,9 +7,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
 
 <meta name="dcterms.date" content="2026-03-29">
-<meta name="description" content="Data stored in postgres is persisted on disk. But how exactly? In this blog post, we explore how postgres stores data on disk.">
+<meta name="description" content="Data stored in postgres is persisted on disk. But how exactly? In this blog post, we trace an insert to its raw bytes on disk">
 
-<title>How Does Postgres Store Data? – The WAL Street Journal</title>
+<title>How Does Postgres Store Data on Disk? – The WAL Street Journal</title>
 <style>
 code{white-space: pre-wrap;}
 span.smallcaps{font-variant: small-caps;}
@@ -125,12 +125,20 @@ gtag('config', 'G-NMYW1XQTP9', { 'anonymize_ip': true});
 
 
 <link rel="stylesheet" href="../../styles.css">
-<meta property="og:title" content="How Does Postgres Store Data? – The WAL Street Journal">
-<meta property="og:description" content="Data stored in postgres is persisted on disk. But how exactly? In this blog post, we explore how postgres stores data on disk.">
+<meta property="og:title" content="How Does Postgres Store Data on Disk? – The WAL Street Journal">
+<meta property="og:description" content="Data stored in postgres is persisted on disk. But how exactly? In this blog post, we trace an insert to its raw bytes on disk">
+<meta property="og:image" content="https://thewalstreetjournal.github.io/posts/how-postgres-stores-data/segments-and-pages.png">
 <meta property="og:site_name" content="The WAL Street Journal">
-<meta name="twitter:title" content="How Does Postgres Store Data? – The WAL Street Journal">
-<meta name="twitter:description" content="Data stored in postgres is persisted on disk. But how exactly? In this blog post, we explore how postgres stores data on disk.">
-<meta name="twitter:card" content="summary">
+<meta property="og:image:alt" content="A table stored as segment files 16388, 16388.1 and 16388.2 of up to 1 GB each. The first segment is a sequence of 8 KB pages, page 0 to page 131071.">
+<meta property="og:image:height" content="2160">
+<meta property="og:image:width" content="3840">
+<meta name="twitter:title" content="How Does Postgres Store Data on Disk? – The WAL Street Journal">
+<meta name="twitter:description" content="Data stored in postgres is persisted on disk. But how exactly? In this blog post, we trace an insert to its raw bytes on disk">
+<meta name="twitter:image" content="https://thewalstreetjournal.github.io/posts/how-postgres-stores-data/segments-and-pages.png">
+<meta name="twitter:image:alt" content="A table stored as segment files 16388, 16388.1 and 16388.2 of up to 1 GB each. The first segment is a sequence of 8 KB pages, page 0 to page 131071.">
+<meta name="twitter:image-height" content="2160">
+<meta name="twitter:image-width" content="3840">
+<meta name="twitter:card" content="summary_large_image">
 </head>
 
 <body class="nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
@@ -349,10 +357,10 @@ gtag('config', 'G-NMYW1XQTP9', { 'anonymize_ip': true});
 <header id="title-block-header" class="quarto-title-block default page-columns page-full">
   <div class="quarto-title-banner page-columns page-full">
     <div class="quarto-title column-body">
-      <h1 class="title">How Does Postgres Store Data?</h1>
+      <h1 class="title">How Does Postgres Store Data on Disk?</h1>
                   <div>
         <div class="description">
-          Data stored in postgres is persisted on disk. But how exactly? In this blog post, we explore how postgres stores data on disk.
+          Data stored in postgres is persisted on disk. But how exactly? In this blog post, we trace an insert to its raw bytes on disk
         </div>
       </div>
                           <div class="quarto-categories">
@@ -385,11 +393,18 @@ gtag('config', 'G-NMYW1XQTP9', { 'anonymize_ip': true});
     <h2 id="toc-title">On this page</h2>
    
   <ul>
-  <li><a href="#how-does-postgres-store-data" id="toc-how-does-postgres-store-data" class="nav-link active" data-scroll-target="#how-does-postgres-store-data">How Does Postgres Store Data?</a>
+  <li><a href="#how-postgres-organizes-storage" id="toc-how-postgres-organizes-storage" class="nav-link active" data-scroll-target="#how-postgres-organizes-storage">How postgres organizes storage</a></li>
+  <li><a href="#prerequisites" id="toc-prerequisites" class="nav-link" data-scroll-target="#prerequisites">Prerequisites</a>
   <ul class="collapse">
-  <li><a href="#prerequisites" id="toc-prerequisites" class="nav-link" data-scroll-target="#prerequisites">Prerequisites</a></li>
-  <li><a href="#storage-in-postgres" id="toc-storage-in-postgres" class="nav-link" data-scroll-target="#storage-in-postgres">Storage in Postgres</a></li>
-  <li><a href="#credits-and-resources" id="toc-credits-and-resources" class="nav-link" data-scroll-target="#credits-and-resources">Credits and Resources:</a></li>
+  <li><a href="#finding-the-data-directory" id="toc-finding-the-data-directory" class="nav-link" data-scroll-target="#finding-the-data-directory">Finding the data directory</a></li>
+  <li><a href="#finding-the-tables-file" id="toc-finding-the-tables-file" class="nav-link" data-scroll-target="#finding-the-tables-file">Finding the table’s file</a></li>
+  <li><a href="#decoding-the-page-header" id="toc-decoding-the-page-header" class="nav-link" data-scroll-target="#decoding-the-page-header">Decoding the page header</a></li>
+  <li><a href="#decoding-the-line-pointer" id="toc-decoding-the-line-pointer" class="nav-link" data-scroll-target="#decoding-the-line-pointer">Decoding the line pointer</a></li>
+  <li><a href="#decoding-the-tuple" id="toc-decoding-the-tuple" class="nav-link" data-scroll-target="#decoding-the-tuple">Decoding the tuple</a></li>
+  <li><a href="#the-easy-way-pageinspect" id="toc-the-easy-way-pageinspect" class="nav-link" data-scroll-target="#the-easy-way-pageinspect">The easy way: pageinspect</a></li>
+  <li><a href="#summary" id="toc-summary" class="nav-link" data-scroll-target="#summary">Summary</a></li>
+  <li><a href="#what-i-left-out" id="toc-what-i-left-out" class="nav-link" data-scroll-target="#what-i-left-out">What I left out</a></li>
+  <li><a href="#credits-and-resources" id="toc-credits-and-resources" class="nav-link" data-scroll-target="#credits-and-resources">Credits and Resources</a></li>
   </ul></li>
   </ul>
 </nav>
@@ -402,116 +417,426 @@ gtag('config', 'G-NMYW1XQTP9', { 'anonymize_ip': true});
 
 
 
-<section id="how-does-postgres-store-data" class="level1">
-<h1>How Does Postgres Store Data?</h1>
-<p>As we all know, postgres is an awesome, open source database system. In these series of blog posts, I am going to explore some internals of Postgres.</p>
-<p>In this post, we explore how postgres internally organizes and stores data that we expect it to store.</p>
-<hr>
+<p>If you insert a row into a postgres table, could you go and find it on disk? The actual file, the actual bytes? That’s what we’re going to do in this post. We’ll insert one row, find the file it lives in, and then decode it byte by byte using the structs from the postgres source code.</p>
+<p>Prefer video? Here’s the same walkthrough:</p>
+<div class="quarto-video ratio ratio-16x9"><iframe data-external="1" src="https://www.youtube.com/embed/1tNMRcgUtb8" title="" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen=""></iframe></div>
+<section id="how-postgres-organizes-storage" class="level3">
+<h3 class="anchored" data-anchor-id="how-postgres-organizes-storage">How postgres organizes storage</h3>
+<p>Before we go inserting and searching for data, let’s first build a picture of how postgres organizes data. That way, when we trace the bytes for our data, we’ll know what we’re looking at.</p>
+<p>In Postgres, every table is stored in one or more files. We call these files <strong>segment files</strong>. A segment file can grow up to 1GB. If a table grows beyond 1GB, postgres creates another segment file for the next 1GB, then another one, and so on. For a table whose file is named <code>16388</code>, the segments would be named <code>16388</code>, <code>16388.1</code>, <code>16388.2</code>, and so on. ( The 1GB limit can be changed at the time of setup )</p>
+<p>Each segment file is made of <strong>pages</strong> ( also called <em>blocks</em> ). A page is 8KB by default. This too can only be changed at compile time. The page is the smallest unit of IO in postgres: when postgres reads from or writes to a table file, it reads or writes a whole 8KB page. Any change to a row, however small, happens by changing the page that contains it.</p>
+<div class="quarto-figure quarto-figure-center">
+<figure class="figure">
+<p><img src="segments-and-pages.png" class="img-fluid figure-img" alt="A table stored as segment files 16388, 16388.1 and 16388.2 of up to 1 GB each. The first segment is a sequence of 8 KB pages, page 0 to page 131071."></p>
+<figcaption>segments-and-pages</figcaption>
+</figure>
+</div>
+<p>Now let’s zoom into a page. Every page has the same layout:</p>
+<ul>
+<li>A <strong>page header</strong> of 24 bytes at the start.</li>
+<li>An array of <strong>line pointers</strong> right after the header. Each line pointer is 4 bytes and points to one row in the page. This array grows from the top of the page downwards.</li>
+<li>The <strong>tuples</strong> ( rows ) themselves, which are stored from the bottom of the page upwards.</li>
+<li>The <strong>free space</strong> in between. New rows go here. The line pointers grow into it from the top, the tuples grow into it from the bottom.</li>
+<li>There’s also some <strong>special space</strong> at the very end. Tables don’t use it, but some indexes use it. This is beyond our scope for this post.</li>
+</ul>
+<div class="quarto-figure quarto-figure-center">
+<figure class="figure">
+<p><img src="page-layout.png" class="img-fluid figure-img" alt="Inside an 8 KB page: a 24-byte page header, then line pointers lp 1 to lp 3 pointing to the rows Bob, Alice and Carol stored from the bottom of the page, with free space in between. pd_lower is 36 and pd_upper is 8072."></p>
+<figcaption>page-layout</figcaption>
+</figure>
+</div>
+<p>Each tuple also has a small header of its own, with things like the transaction id that created it, followed by the actual column values.</p>
+<section id="why-do-we-need-line-pointers" class="level4">
+<h4 class="anchored" data-anchor-id="why-do-we-need-line-pointers">Why do we need line pointers?</h4>
+<p>Why not just store the tuples one after another from the start of the page?</p>
+<p>For a moment, assume that we don’t have line pointers and we placed the tuples one after the other from the start. Then row 3 in a page got deleted. Now there’s a hole in the middle of the page. To reuse that space, we would want to move the other rows to close the gap. But we can’t just move a row, because indexes may point to it. In order to move rows around, we may also need to move around indexes, which is not efficient.</p>
+<p>With line pointers, we introduce indirection. Postgres can shuffle the tuples around inside the page to close the gaps, and it only has to update the offsets in the line pointers. The line pointer numbers themselves stay the same, so every index entry that points to row 3 still finds it. This is why these are also called <strong>slotted pages</strong>: each row has a fixed slot, and the slot knows where the row currently lives.</p>
+<iframe src="why-line-pointers.html" title="Why line pointers" style="width:100%;aspect-ratio:800/720;border:0" loading="lazy">
+</iframe>
+<p>So, to summarise: a table is stored in segment files, a segment file is made of 8KB pages, and every page has a header, line pointers growing from the top, tuples growing from the bottom, and free space in the middle.</p>
+<p>Now let’s go insert some data and find it on disk. The numbers in the outputs below ( OIDs, file names, the LSN and the transaction id ) will be slightly different on your machine, but the layout will be exactly the same.</p>
+</section>
+</section>
 <section id="prerequisites" class="level2">
 <h2 class="anchored" data-anchor-id="prerequisites">Prerequisites</h2>
-<p>For this ( and subsequent ) posts, I am assuming that the reader:</p>
+<p>For this post, I’m assuming you know what docker containers are and how to build and run them.</p>
+<p>I’m using the same postgres container as the <a href="../how-postgres-handles-connections/">previous post</a>, with a few extra tools installed for looking at binary files ( like <code>xxd</code> ). The Dockerfile is on <a href="https://github.com/thewalstreetjournal/postgres-playlist/tree/main/002-how-postgres-stores-data">GitHub</a>.</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> build <span class="at">-t</span> postgres-17.6:v1 .</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co"># To let the python app talk to postgres, we create a docker network</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> network create pgnet</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> run <span class="at">-d</span> <span class="at">--name</span> postgres <span class="at">--network</span> pgnet <span class="at">-e</span> POSTGRES_PASSWORD=secret postgres-17.6:v1</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="co"># Open a shell inside the container</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> exec <span class="at">-it</span> postgres bash</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>I’ll keep two terminals open inside the container: one for <code>psql</code> and one for looking at the files.</p>
+<section id="finding-the-data-directory" class="level3">
+<h3 class="anchored" data-anchor-id="finding-the-data-directory">Finding the data directory</h3>
+<p>Since postgres is running in this container, it must be storing its data in some directory. This location is usually in the <code>PGDATA</code> environment variable:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="va">$PGDATA</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co"># /var/lib/postgresql/data</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>If we list this directory, we see a bunch of files and subdirectories:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> <span class="va">$PGDATA</span> <span class="kw">&amp;&amp;</span> <span class="fu">ls</span> <span class="at">-l</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<pre><code>total 128
+drwx------ 6 postgres postgres  4096 Mar 14 13:05 base
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 global
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_commit_ts
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_dynshmem
+-rw------- 1 postgres postgres  5743 Mar 14 13:05 pg_hba.conf
+-rw------- 1 postgres postgres  2640 Mar 14 13:05 pg_ident.conf
+drwx------ 4 postgres postgres  4096 Mar 14 13:05 pg_logical
+drwx------ 4 postgres postgres  4096 Mar 14 13:05 pg_multixact
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_notify
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_replslot
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_serial
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_snapshots
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_stat
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_stat_tmp
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_subtrans
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_tblspc
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_twophase
+-rw------- 1 postgres postgres     3 Mar 14 13:05 PG_VERSION
+drwx------ 4 postgres postgres  4096 Mar 14 13:05 pg_wal
+drwx------ 2 postgres postgres  4096 Mar 14 13:05 pg_xact
+-rw------- 1 postgres postgres    88 Mar 14 13:05 postgresql.auto.conf
+-rw------- 1 postgres postgres 30777 Mar 14 13:05 postgresql.conf
+-rw------- 1 postgres postgres    36 Mar 14 13:05 postmaster.opts
+-rw------- 1 postgres postgres    94 Mar 14 13:05 postmaster.pid</code></pre>
+<p>Some of these handle replication, some handle the write ahead log, some are config files. For now, we only care about <code>base</code>. This is where postgres stores the data for every database.</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> base/</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 1  16385  4  5</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>These numbers are <strong>object identifiers</strong>, or OIDs. Postgres gives an OID to almost everything it creates: databases, tables, indexes, roles and so on. Inside <code>base/</code>, there is one subdirectory per database, named after that database’s OID.</p>
+<p>Let’s create a new database and watch a new directory show up. In the <code>psql</code> terminal ( <code>psql -U postgres</code> ):</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">DATABASE</span> dummy;</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="kw">oid</span>, datname <span class="kw">FROM</span> pg_database;</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>We get this output:</p>
+<pre><code>  oid  |  datname
+-------+------------
+     5 | postgres
+ 16385 | mydatabase
+     1 | template1
+     4 | template0
+ 16386 | dummy</code></pre>
+<p><code>1</code>, <code>4</code> and <code>5</code> are the default databases. <code>16385</code> is <code>mydatabase</code>, which our Dockerfile creates. And <code>16386</code> is the <code>dummy</code> database we just created. Your OIDs might be different.</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb8"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> base/</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 1  16385  16386  4  5</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>We can see the directory for our databae. If we look inside the new directory, we already see about 300 files, even though we haven’t created a single table yet:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb9"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> base/16386 <span class="kw">|</span> <span class="fu">wc</span> <span class="at">-l</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 298</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>These are the system catalogs, which are postgres’s own internal tables. Every new database is a copy of the <code>template1</code> database, so it starts with its own copy of all of the system catalogs.</p>
+<hr>
+</section>
+<section id="finding-the-tables-file" class="level3">
+<h3 class="anchored" data-anchor-id="finding-the-tables-file">Finding the table’s file</h3>
+<p>Now let’s create a table and insert a row. Switch to the <code>dummy</code> database with <code>\c dummy</code> and run:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb10"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> users (</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">id</span>   serial <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>    name text,</span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    age  <span class="dt">int</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> users (name, age) <span class="kw">VALUES</span> (<span class="st">'Bob'</span>, <span class="dv">25</span>);</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>To find the file for this table, postgres has a function:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb11"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_relation_filepath(<span class="st">'users'</span>);</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<pre><code> pg_relation_filepath
+----------------------
+ base/16386/16388</code></pre>
+<p>So our row is somewhere inside <code>base/16386/16388</code>. This number is the table’s <strong>relfilenode</strong>. It often matches the table’s OID, but not always ( some commands like <code>TRUNCATE</code> can give the table a new file ), so it’s better to query postgres than to assume.</p>
+<p>Let’s look at the file:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb13"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-l</span> base/16386/16388</span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="co"># -rw------- 1 postgres postgres 8192 ... base/16386/16388</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>It’s exactly 8192 bytes, which is one page. Now let’s dump the file bytes using <code>xxd</code>:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb14"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="ex">xxd</span> <span class="at">-a</span> base/16386/16388</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<pre><code>00000000: 0000 0000 a8ac d401 0000 0000 1c00 d81f  ................
+00000010: 0020 0420 0000 0000 d89f 4800 0000 0000  . . ......H.....
+00000020: 0000 0000 0000 0000 0000 0000 0000 0000  ................
+*
+00001fd0: 0000 0000 0000 0000 de02 0000 0000 0000  ................
+00001fe0: 0000 0000 0000 0000 0100 0300 0208 1800  ................
+00001ff0: 0100 0000 0942 6f62 1900 0000 0000 0000  .....Bob........</code></pre>
+<p>This already matches the picture we had in mind. There are a few non-zero bytes at the start ( the page header and the line pointer ), a lot of empty space (zero bytes) in the middle ( the <code>*</code> means “the same line repeated” ), and a few non-zero bytes at the very end ( our tuple ). We can even see <code>Bob</code> sitting in the last line.</p>
+<p>Now let’s decode these bytes properly.</p>
+<hr>
+</section>
+<section id="decoding-the-page-header" class="level3">
+<h3 class="anchored" data-anchor-id="decoding-the-page-header">Decoding the page header</h3>
+<p>The page header, line pointers and tuples are all just C structs. So if we read the structs in the postgres source code, we can interpret the bytes.</p>
+<p>The page header is <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/include/storage/bufpage.h#L155-L168"><code>PageHeaderData</code> in <code>bufpage.h</code></a>:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb16"><pre class="sourceCode c code-with-copy"><code class="sourceCode c"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> PageHeaderData</span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a>    PageXLogRecPtr pd_lsn<span class="op">;</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a>    uint16      pd_checksum<span class="op">;</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a>    uint16      pd_flags<span class="op">;</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a>    LocationIndex pd_lower<span class="op">;</span>     <span class="co">/* offset to start of free space */</span></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a>    LocationIndex pd_upper<span class="op">;</span>     <span class="co">/* offset to end of free space */</span></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a>    LocationIndex pd_special<span class="op">;</span>   <span class="co">/* offset to start of special space */</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a>    uint16      pd_pagesize_version<span class="op">;</span></span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a>    TransactionId pd_prune_xid<span class="op">;</span></span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a>    ItemIdData  pd_linp<span class="op">[</span>FLEXIBLE_ARRAY_MEMBER<span class="op">];</span> <span class="co">/* line pointer array */</span></span>
+<span id="cb16-12"><a href="#cb16-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> PageHeaderData<span class="op">;</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Everything except the line pointer array adds up to the first 24 bytes of the page. Let’s print just those:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb17"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="ex">xxd</span> <span class="at">-l</span> 24 base/16386/16388</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<pre><code>00000000: 0000 0000 a8ac d401 0000 0000 1c00 d81f  ................
+00000010: 0020 0420 0000 0000                      . . ....</code></pre>
+<p>One thing to know before reading these: the numbers are stored in <strong>little endian</strong> order. In a multi-byte number, the least significant byte comes first. So the two bytes <code>1c 00</code> are the 16 bit number <code>0x001c</code>, and <code>d8 1f</code> is <code>0x1fd8</code>. The bits inside each byte are not reversed, only the order of the bytes.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 25%">
+<col style="width: 25%">
+<col style="width: 25%">
+<col style="width: 25%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Bytes</th>
+<th>Field</th>
+<th>Raw</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>0–7</td>
+<td><code>pd_lsn</code></td>
+<td><code>00000000 a8acd401</code></td>
+<td><code>0/1D4ACA8</code>, the WAL position of the last change to this page</td>
+</tr>
+<tr class="even">
+<td>8–9</td>
+<td><code>pd_checksum</code></td>
+<td><code>00 00</code></td>
+<td>0, data checksums are off by default</td>
+</tr>
+<tr class="odd">
+<td>10–11</td>
+<td><code>pd_flags</code></td>
+<td><code>00 00</code></td>
+<td>0</td>
+</tr>
+<tr class="even">
+<td>12–13</td>
+<td><code>pd_lower</code></td>
+<td><code>1c 00</code></td>
+<td><strong>28</strong>, start of the free space</td>
+</tr>
+<tr class="odd">
+<td>14–15</td>
+<td><code>pd_upper</code></td>
+<td><code>d8 1f</code></td>
+<td><strong>8152</strong>, end of the free space</td>
+</tr>
+<tr class="even">
+<td>16–17</td>
+<td><code>pd_special</code></td>
+<td><code>00 20</code></td>
+<td>8192, the special space is empty</td>
+</tr>
+<tr class="odd">
+<td>18–19</td>
+<td><code>pd_pagesize_version</code></td>
+<td><code>04 20</code></td>
+<td><code>0x2004</code>: page size 8192 + layout version 4</td>
+</tr>
+<tr class="even">
+<td>20–23</td>
+<td><code>pd_prune_xid</code></td>
+<td><code>00 00 00 00</code></td>
+<td>0, nothing to prune yet</td>
+</tr>
+</tbody>
+</table>
+<p><code>pd_lower</code> and <code>pd_upper</code> tell the whole story of this page. The free space starts at byte 28, which is the 24 byte header plus one 4 byte line pointer. It ends at byte 8152, which is where our tuple starts. Everything in between, 8124 bytes, is free.</p>
+<p>The LSN will be different on your machine. We’ll talk about LSNs when we look at the write ahead log.</p>
+<hr>
+</section>
+<section id="decoding-the-line-pointer" class="level3">
+<h3 class="anchored" data-anchor-id="decoding-the-line-pointer">Decoding the line pointer</h3>
+<p>Right after the header, at byte 24, comes the line pointer array. A line pointer is the <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/include/storage/itemid.h#L25-L30"><code>ItemIdData</code> struct in <code>itemid.h</code></a>:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb19"><pre class="sourceCode c code-with-copy"><code class="sourceCode c"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> ItemIdData</span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span>    lp_off<span class="op">:</span><span class="dv">15</span><span class="op">,</span>      <span class="co">/* offset to tuple (from start of page) */</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a>                lp_flags<span class="op">:</span><span class="dv">2</span><span class="op">,</span>     <span class="co">/* state of line pointer, see below */</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a>                lp_len<span class="op">:</span><span class="dv">15</span><span class="op">;</span>      <span class="co">/* byte length of tuple */</span></span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> ItemIdData<span class="op">;</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>It’s a single 32 bit number split into three bit fields: 15 bits for the offset of the tuple, 2 bits for flags, and 15 bits for the length of the tuple. We have one row, so we have one line pointer. Let’s read bytes 24 to 27 in binary:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb20"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="ex">xxd</span> <span class="at">-s</span> 24 <span class="at">-l</span> 4 <span class="at">-b</span> base/16386/16388</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<pre><code>00000018: 11011000 10011111 01001000 00000000                    ..H.</code></pre>
+<p>This is where it gets slightly confusing. Because of little endian, we first have to put the four bytes back in the right order, which means reversing them:</p>
+<pre><code>00000000 01001000 10011111 11011000</code></pre>
+<p>Now we can read the fields from the right, since <code>lp_off</code> is the lowest field:</p>
+<pre><code> lp_len (15 bits)   lp_flags (2)   lp_off (15 bits)
+ 000000000100100       01        001111111011000</code></pre>
 <ul>
-<li>Knows what docker containers are, how to build and run them.</li>
-<li>Is familiar with the terms processes, threads, and virtual memory</li>
+<li><code>lp_off</code> = <code>001111111011000</code> = <strong>8152</strong>. The tuple starts at byte 8152.</li>
+<li><code>lp_flags</code> = <code>01</code> = <strong>1</strong>, which is <code>LP_NORMAL</code>. This is a normal, live row.</li>
+<li><code>lp_len</code> = <code>000000000100100</code> = <strong>36</strong>. The tuple is 36 bytes long.</li>
 </ul>
-<p>For this post, I am using a docker container for postgres and a docker container for a simple application connecting to postgres. Both files can be found here.</p>
-<p>To build the containers, run:</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Build the postgres and the python application images</span></span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> build <span class="at">-t</span> postgres-17.6:v1 .</span>
-<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> build <span class="at">-f</span> Dockerfile.client <span class="at">-t</span> pg-client:v1 .</span>
-<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="co"># To let the python app talk to postgres, we create a docker network</span></span>
-<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> network create pgnet</span>
-<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Run the docker container for postgres</span></span>
-<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> run <span class="at">-d</span> <span class="at">--name</span> postgres <span class="at">--network</span> pgnet <span class="at">-e</span> POSTGRES_PASSWORD=secret postgres-17.6:v1</span>
-<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="co"># Run the docker container for the python application</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>So our row starts at byte 8152 and is 36 bytes long. That means it ends at byte 8188, and the last 4 bytes of the page are just padding.</p>
 <hr>
 </section>
-<section id="storage-in-postgres" class="level2">
-<h2 class="anchored" data-anchor-id="storage-in-postgres">Storage in Postgres</h2>
-<p>Before we start the actual exploration, note that in the Dockerfile, we have created a user <code>myuser</code> and a database <code>mydatabase</code> in our postgres server.</p>
-<p>Now, let’s create a table in our database so that we can insert some data. Let’s exec into the postgres container using:</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> exec <span class="at">-it</span> postgres bash</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<p>Once inside, we can do: <code>psql -U myuser -d mydatabase</code>. This opens a client connection to <code>mydatabase</code> using <code>myuser</code>. From the postgres server point of view, this is just another connection. Now we can create the table and insert some data as:</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> mytable (<span class="kw">id</span> <span class="dt">INT</span>, name TEXT);</span>
-<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> mytable <span class="kw">VALUES</span> (<span class="dv">1</span>, <span class="st">'Alice'</span>);</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<p>We receive a response from the postgres server saying that the insert was successfully done. Postgres has successfully persisted this data onto disk. But what does it mean to “persist data on disk”? At the end of the day, these are simply files! Whatever data we insert is stored in some file, in some directory created by the postgres server.</p>
-<p>We can do <code>SHOW data_directory;</code> to get the directory path where the data files are stored. I see <code>/var/lib/postgresql/data</code> as the output. On most Linux/Docker based containers, this is going to be the path unless configured differently. Let’s get into this directory and see what’s there:</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># First close the client connection and get out of psql</span></span>
-<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="bu">exit</span></span>
-<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> /var/lib/postgresql/data</span>
-<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-l</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<p>We see the following output:</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres@7997d00b7436:~/data$</span> ls <span class="at">-l</span></span>
-<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">total</span> 128</span>
-<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 6 postgres postgres  4096 Mar 14 13:05 base</span>
-<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 global</span>
-<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_commit_ts</span>
-<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_dynshmem</span>
-<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="ex">-rw-------</span> 1 postgres postgres  5743 Mar 14 13:05 pg_hba.conf</span>
-<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="ex">-rw-------</span> 1 postgres postgres  2640 Mar 14 13:05 pg_ident.conf</span>
-<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 4 postgres postgres  4096 Mar 14 13:05 pg_logical</span>
-<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 4 postgres postgres  4096 Mar 14 13:05 pg_multixact</span>
-<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_notify</span>
-<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_replslot</span>
-<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_serial</span>
-<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_snapshots</span>
-<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_stat</span>
-<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_stat_tmp</span>
-<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_subtrans</span>
-<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_tblspc</span>
-<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_twophase</span>
-<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="ex">-rw-------</span> 1 postgres postgres     3 Mar 14 13:05 PG_VERSION</span>
-<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 4 postgres postgres  4096 Mar 14 13:05 pg_wal</span>
-<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres  4096 Mar 14 13:05 pg_xact</span>
-<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a><span class="ex">-rw-------</span> 1 postgres postgres    88 Mar 14 13:05 postgresql.auto.conf</span>
-<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a><span class="ex">-rw-------</span> 1 postgres postgres 30777 Mar 14 13:05 postgresql.conf</span>
-<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a><span class="ex">-rw-------</span> 1 postgres postgres    36 Mar 14 13:05 postmaster.opts</span>
-<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a><span class="ex">-rw-------</span> 1 postgres postgres    94 Mar 14 13:05 postmaster.pid</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<p>Already we see there are some files and directories present in this. You can check what these files contain by doing: <code>cat &lt;filename&gt;</code>. Mostly these are configuration files that we’re not going to get into now. We’re also not going to touch any other directories than <code>base</code>. Each is a separate blog post on its own!</p>
-<p>If we do, <code>cd /base/ &amp;&amp; ls -l</code>, we see several subdirectories named after some numbers:</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres@7997d00b7436:~/data$</span> cd base/ <span class="kw">&amp;&amp;</span> <span class="fu">ls</span> <span class="at">-l</span></span>
-<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">total</span> 16</span>
-<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres 4096 Mar 14 13:08 1</span>
-<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres 4096 Mar 14 13:05 16385</span>
-<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres 4096 Mar 14 13:05 4</span>
-<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="ex">drwx------</span> 2 postgres postgres 4096 Mar 14 13:07 5</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<p>These numbers are called Object IDs or OIDs in Postgres. Every object that postgres creates- table, index, function, role, database, anything - gets an OID. These subdirectories are data directories for each of the database that we have in our postgres server. There are some default databases and there is one database that we have created.</p>
-<p>Each of these directories are going to contain some files containing the data of the tables in the database and some files for additional metadata for efficiency. Let’s find out which of these directories is for <code>mydatabase</code>.</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb7"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Connect to postgres server as a client</span></span>
-<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">psql</span> <span class="at">-U</span> myuser <span class="at">-d</span> mydatabase</span>
-<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="ex">SELECT</span> oid, datname FROM pg_database<span class="kw">;</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<p>I see that <code>mydatabase</code> has an OID of 16385. This number might be different for you. There are other default and template databases as well, which we don’t have to worry about for now. <code>exit</code> this connection.</p>
-<p>Now, we can <code>cd</code> into the directory for our database and see what’s present there.</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb8"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> 16385/ <span class="kw">&amp;&amp;</span> <span class="fu">ls</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<p>Whoa! We have just one table with just one row in <code>mydatabase</code> yet there are about 300 files present in this directory. These are mostly system catalogs that postgres cloned from the template database.</p>
-<p>Now, let’s try to find the file for our table.</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb9"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="kw">select</span> relname, relfilenode, reltablespace <span class="kw">from</span> pg_class <span class="kw">where</span> relname <span class="op">=</span> <span class="st">'mytable'</span>;</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<p>We see the output as:</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb10"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a> relname | relfilenode | reltablespace </span>
-<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="co">---------+-------------+---------------</span></span>
-<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a> mytable |       <span class="dv">16390</span> |             <span class="dv">0</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<p>The <code>relfilenode</code> is the file name for our table. If we go back to the data directory, the file 16390 contains the data that we inserted. But this is a binary file. At times, databases will apply some encoding or compression while storing data in files. As a result, the files are not directly readable- we can’t simply do <code>cat &lt;filename&gt;</code> and expect to read the entire contents. So how can we understand this data file and the file structure?</p>
-<p>When postgres stores data, it doesn’t store one row or a few bytes. It thinks in terms of “pages” or “blocks”. Each block is given a fixed size of 8KB by default, though we can change this while setting up postgres. A file is made up of one or more such blocks. Naturally, it implies that size of each file will be in multiple of 8KB. Any data file of any database (even the system catalogs) are organized into blocks.</p>
-<p>We can see that there seem to be several different files here- these are called “forks”. Each relation (i.e.&nbsp;table) can have upto four “forks”: | File | Fork | Purpose | |——|——|———| | <code>{filenode}</code> | main | Actual row data | | <code>{filenode}_fsm</code> | FSM | Free Space Map — tracks available space per page. Used for efficiency | | <code>{filenode}_vm</code> | VM | Visibility Map — tracks per-page visibility and freeze status. Used for concurrency control | | <code>{filenode}_init</code> | init | Unlogged tables/indexes only — template for reset after crash |</p>
-<p>We can list the binary contents of the <code>16390</code> file by doing <code>hexdump 16390</code>. This isn’t very helpful ofcourse since it’s binary, but observe that at the beginning there are a few bytes written and there are a few bytes written at the end. We can decode this binary dump to see if we can interpret this.</p>
-<p>The structure of a postgres data file looks something like the following:</p>
-<!-- TODO: Insert the image of a segment files containing several pages -->
-<p>As we can see, the table’s data is broken into “segments” of size 1GB ( this too is configurable ). For our table, if we had 4GB of data, the segment files will be named as: <code>16390</code>, <code>16390.1</code>, <code>16390.2</code>, and <code>16390.3</code>. Each segment file is made of one or more blocks. Each block has some headers, a slot array, and the rows. First block of a segment has some special headers as well. The slot array tells the offset for a row within the block. The slot array grows from the top while the rows grow from the bottom. The space in between them is the “free space” where new inserts can go.</p>
-<p>Now that we know how the data is organized in a segment file, let’s see if we can interpret it. We won’t get into headers that much, but rather focus on the ItemIdData array and the tuple data.</p>
+<section id="decoding-the-tuple" class="level3">
+<h3 class="anchored" data-anchor-id="decoding-the-tuple">Decoding the tuple</h3>
+<p>Now let’s read those 36 bytes:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb24"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="ex">xxd</span> <span class="at">-s</span> 8152 <span class="at">-l</span> 36 base/16386/16388</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<pre><code>00001fd8: de02 0000 0000 0000 0000 0000 0000 0000  ................
+00001fe8: 0100 0300 0208 1800 0100 0000 0942 6f62  .............Bob
+00001ff8: 1900 0000                                ....</code></pre>
+<p>Every tuple starts with a header, defined as <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/include/access/htup_details.h#L153-L179"><code>HeapTupleHeaderData</code> in <code>htup_details.h</code></a>. The fields add up to 23 bytes. Postgres then rounds that up to 24, so that the column data starts at an aligned offset.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 25%">
+<col style="width: 25%">
+<col style="width: 25%">
+<col style="width: 25%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Bytes</th>
+<th>Field</th>
+<th>Raw</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>0–3</td>
+<td><code>t_xmin</code></td>
+<td><code>de 02 00 00</code></td>
+<td>734, the transaction that inserted this row</td>
+</tr>
+<tr class="even">
+<td>4–7</td>
+<td><code>t_xmax</code></td>
+<td><code>00 00 00 00</code></td>
+<td>0, no transaction has deleted it</td>
+</tr>
+<tr class="odd">
+<td>8–11</td>
+<td><code>t_cid</code></td>
+<td><code>00 00 00 00</code></td>
+<td>0, the first command in its transaction</td>
+</tr>
+<tr class="even">
+<td>12–17</td>
+<td><code>t_ctid</code></td>
+<td><code>0000 0000 0100</code></td>
+<td>(0, 1): page 0, line pointer 1, the row points at itself</td>
+</tr>
+<tr class="odd">
+<td>18–19</td>
+<td><code>t_infomask2</code></td>
+<td><code>03 00</code></td>
+<td>3, the number of columns</td>
+</tr>
+<tr class="even">
+<td>20–21</td>
+<td><code>t_infomask</code></td>
+<td><code>02 08</code></td>
+<td><code>0x0802</code>: <code>HEAP_HASVARWIDTH</code> ( has a text column ) and <code>HEAP_XMAX_INVALID</code></td>
+</tr>
+<tr class="odd">
+<td>22</td>
+<td><code>t_hoff</code></td>
+<td><code>18</code></td>
+<td>24, the column data starts 24 bytes into the tuple</td>
+</tr>
+<tr class="even">
+<td>23</td>
+<td></td>
+<td><code>00</code></td>
+<td>padding</td>
+</tr>
+</tbody>
+</table>
+<p>You can check <code>t_xmin</code> from psql: <code>SELECT xmin, * FROM users;</code> returns <code>734</code>. Your number will be different.</p>
+<p>The <code>t_ctid</code> field is the same ( page, line pointer ) pair that indexes use. Here we can see it in the bytes: <code>0000 0000</code> is block 0 and <code>0100</code> is line pointer 1.</p>
+<p>After the header come the 12 bytes of actual data:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb26"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a><span class="ex">xxd</span> <span class="at">-s</span> 8176 <span class="at">-l</span> 12 base/16386/16388</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<pre><code>00001ff0: 0100 0000 0942 6f62 1900 0000            .....Bob....</code></pre>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Bytes</th>
+<th>Column</th>
+<th>Raw</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>0–3</td>
+<td><code>id</code> ( int )</td>
+<td><code>01 00 00 00</code></td>
+<td>1</td>
+</tr>
+<tr class="even">
+<td>4</td>
+<td><code>name</code> length</td>
+<td><code>09</code></td>
+<td>a 1 byte length header</td>
+</tr>
+<tr class="odd">
+<td>5–7</td>
+<td><code>name</code> ( text )</td>
+<td><code>42 6f 62</code></td>
+<td>“Bob”</td>
+</tr>
+<tr class="even">
+<td>8–11</td>
+<td><code>age</code> ( int )</td>
+<td><code>19 00 00 00</code></td>
+<td>25</td>
+</tr>
+</tbody>
+</table>
+<p>The integers are easy: 4 bytes each, little endian. The text column is more interesting. Text has a variable length, so postgres needs to store the length too. For short values, it uses a single length byte: the total length shifted left by one, with the lowest bit set to 1 to mark it as a short header ( see <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/include/varatt.h#L236-L237"><code>SET_VARSIZE_1B</code> in <code>varatt.h</code></a> ). “Bob” is 3 bytes, plus 1 for the header, is 4. <code>(4 &lt;&lt; 1) | 1 = 9</code>, which is the <code>09</code> we see.</p>
+<p>And that’s our row: <code>(1, 'Bob', 25)</code>, found on disk, byte by byte.</p>
 <hr>
 </section>
-<section id="credits-and-resources" class="level2">
-<h2 class="anchored" data-anchor-id="credits-and-resources">Credits and Resources:</h2>
+<section id="the-easy-way-pageinspect" class="level3">
+<h3 class="anchored" data-anchor-id="the-easy-way-pageinspect">The easy way: pageinspect</h3>
+<p>Decoding bytes by hand is tedious, and nobody really needs to do it. But I think it’s awesome to do it once. But postgres comes with an extension called <code>pageinspect</code> that does all of this for us:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb28"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> EXTENSION pageinspect;</span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-3"><a href="#cb28-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">lower</span>, <span class="fu">upper</span>, special, pagesize, version</span>
+<span id="cb28-4"><a href="#cb28-4" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> page_header(get_raw_page(<span class="st">'users'</span>, <span class="dv">0</span>));</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<pre><code> lower | upper | special | pagesize | version
+-------+-------+---------+----------+---------
+    28 |  8152 |    8192 |     8192 |       4</code></pre>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb30"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> lp, lp_off, lp_flags, lp_len, t_xmin, t_ctid, t_hoff, t_data</span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> heap_page_items(get_raw_page(<span class="st">'users'</span>, <span class="dv">0</span>));</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<pre><code> lp | lp_off | lp_flags | lp_len | t_xmin | t_ctid | t_hoff |           t_data
+----+--------+----------+--------+--------+--------+--------+----------------------------
+  1 |   8152 |        1 |     36 |    734 | (0,1)  |     24 | \x0100000009426f6219000000</code></pre>
+<p>Every number matches what we decoded by hand. There is also <a href="https://github.com/df7cb/pg_filedump"><code>pg_filedump</code></a>, a command line tool that can read the files directly, without a running server.</p>
+<hr>
+</section>
+<section id="summary" class="level3">
+<h3 class="anchored" data-anchor-id="summary">Summary</h3>
+<p>Postgres stores the data of a table in segment files of up to 1GB. Each segment file is made of 8KB pages, and the page is the unit of IO in postgres. Each page has a 24 byte header, an array of line pointers growing from the top, the tuples growing from the bottom, and free space in between.</p>
+<p>When we insert a row, postgres looks for a page with enough free space. If there isn’t one, it adds a new page to the end of the table’s file. Once the file reaches 1GB, a new segment file is started and the process repeats.</p>
+<hr>
+</section>
+<section id="what-i-left-out" class="level3">
+<h3 class="anchored" data-anchor-id="what-i-left-out">What I left out</h3>
+<p>A few things that didn’t fit in this post:</p>
+<ul>
+<li><strong>Forks.</strong> Right now our table has a single file. Over time, postgres also creates <code>16388_fsm</code> ( the free space map, which helps postgres find a page with enough room for a new row ) and <code>16388_vm</code> ( the visibility map, which helps <code>VACUUM</code> skip pages and makes index-only scans possible ). These usually show up after the first <code>VACUUM</code>. The free space map gets its own post next.</li>
+<li><strong>TOAST.</strong> Large values, like a long text column, don’t fit in an 8KB page. Postgres compresses them and/or moves them to a separate TOAST table, and the row only keeps a pointer.</li>
+<li><strong>NULLs.</strong> If a row has NULL values, the tuple header gets an extra bitmap marking which columns are NULL, and <code>t_hoff</code> grows to make room for it.</li>
+<li><strong>Alignment.</strong> Columns are aligned based on their type. An <code>int</code> must start at a multiple of 4 bytes, for example. In our row that worked out with no padding, but column order can waste space in other tables.</li>
+<li><strong>Updates.</strong> An <code>UPDATE</code> in postgres doesn’t change the row in place. It writes a new version of the row and sets <code>t_xmax</code> and <code>t_ctid</code> on the old one. That’s a topic for another post.</li>
+</ul>
+<hr>
+</section>
+<section id="credits-and-resources" class="level3">
+<h3 class="anchored" data-anchor-id="credits-and-resources">Credits and Resources</h3>
 <p>For this post, I have heavily used Claude Code. Along with that, I have relied on the following resources:</p>
 <ol type="1">
-<li><a href="">Intro to Database Systems, CMU</a></li>
-<li><a href="">PostgreSQL Source Code</a></li>
+<li><a href="https://www.postgresql.org/docs/17/storage-file-layout.html">Database File Layout</a> and <a href="https://www.postgresql.org/docs/17/storage-page-layout.html">Database Page Layout</a>, PostgreSQL docs</li>
+<li><a href="https://15445.courses.cs.cmu.edu/fall2025/">Intro to Database Systems by CMU</a></li>
+<li><a href="https://github.com/postgres/postgres/tree/REL_17_6">Postgres Source Code</a></li>
 </ol>
 <hr>
 
