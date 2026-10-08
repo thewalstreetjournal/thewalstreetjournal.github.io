@@ -5,6 +5,7 @@ categories: [postgres, internals]
 code-fold: true
 description: "Data stored in postgres is persisted on disk. But how exactly? In this blog post, we trace an insert to its raw bytes on disk"
 resources: [why-line-pointers.html]
+image: page-layout.png
 ---
 
 If you insert a row into a postgres table, could you go and find it on disk? The actual file, the actual bytes? That's what we're going to do in this post. We'll insert one row, find the file it lives in, and then decode it byte by byte using the structs from the postgres source code.
