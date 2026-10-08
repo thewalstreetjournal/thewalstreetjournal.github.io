@@ -1,0 +1,68 @@
+<div id="twsj-post-end" class="twsj-post-end" style="display: none;">
+  <hr>
+  <p class="twsj-post-end-links">
+    <a href="https://www.youtube.com/@TheWALStreetJournal?sub_confirmation=1">Subscribe on YouTube</a><span class="twsj-next-wrap" style="display: none;"> · <span class="twsj-next-label">Next post</span>: <a class="twsj-next-link" href="#"></a></span>
+  </p>
+  <p>Get new posts by email:</p>
+  <form action="https://buttondown.com/api/emails/embed-subscribe/thewalstreetjournal"
+        method="post" target="popupwindow"
+        onsubmit="window.open('https://buttondown.com/thewalstreetjournal', 'popupwindow')"
+        class="embeddable-buttondown-form">
+    <div class="input-group" style="max-width: 420px;">
+      <input type="email" name="email" class="form-control"
+             placeholder="you@example.com" aria-label="Email address" required>
+      <button type="submit" class="btn btn-primary">Subscribe</button>
+    </div>
+  </form>
+</div>
+
+<script>
+(function () {
+  // Only on blog posts, not on the home page or About.
+  var path = window.location.pathname;
+  if (path.indexOf('/posts/') === -1) return;
+
+  var block = document.getElementById('twsj-post-end');
+  var main = document.getElementById('quarto-document-content');
+  if (!block || !main) return;
+  main.appendChild(block);
+  block.style.display = '';
+
+  // Normalise "/posts/x/", "/posts/x/index.html" and full URLs to "/posts/x/".
+  function postKey(url) {
+    var p = url.replace(/^https?:\/\/[^\/]+/, '').replace(/index\.html$/, '');
+    var i = p.indexOf('/posts/');
+    return i === -1 ? p : p.slice(i);
+  }
+
+  // The RSS feed has every post with its title and date.
+  fetch('/index.xml')
+    .then(function (r) { return r.text(); })
+    .then(function (text) {
+      var xml = new DOMParser().parseFromString(text, 'application/xml');
+      var posts = Array.prototype.map.call(xml.querySelectorAll('item'), function (item) {
+        return {
+          title: item.querySelector('title').textContent,
+          key: postKey(item.querySelector('link').textContent),
+          date: new Date(item.querySelector('pubDate').textContent)
+        };
+      }).sort(function (a, b) { return a.date - b.date; }); // oldest first
+
+      var here = postKey(path);
+      var i = posts.findIndex(function (p) { return p.key === here; });
+      if (i === -1 || posts.length < 2) return;
+
+      // The next newer post; on the newest post, the one before it.
+      var target = posts[i + 1], label = 'Next post';
+      if (!target) { target = posts[i - 1]; label = 'Previous post'; }
+
+      var wrap = block.querySelector('.twsj-next-wrap');
+      var link = block.querySelector('.twsj-next-link');
+      block.querySelector('.twsj-next-label').textContent = label;
+      link.textContent = target.title;
+      link.href = target.key;
+      wrap.style.display = '';
+    })
+    .catch(function () { /* No feed: keep the YouTube and email links only. */ });
+})();
+</script>
