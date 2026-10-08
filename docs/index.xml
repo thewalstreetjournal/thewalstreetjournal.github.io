@@ -10,7 +10,549 @@
 <atom:link href="https://thewalstreetjournal.github.io/index.xml" rel="self" type="application/rss+xml"/>
 <description>Database internals, read from the source code.</description>
 <generator>quarto-1.8.26</generator>
-<lastBuildDate>Sun, 07 Jun 2026 18:30:00 GMT</lastBuildDate>
+<lastBuildDate>Tue, 06 Oct 2026 18:30:00 GMT</lastBuildDate>
+<item>
+  <title>How ClickHouse Keeper Takes Non-Blocking Snapshots</title>
+  <link>https://thewalstreetjournal.github.io/posts/clickhouse-keeper-non-blocking-snapshots/</link>
+  <description><![CDATA[ 
+
+
+
+
+
+
+<p>Let’s say we have an in-memory database, and it’s serving thousands of writes per second. How do we save a consistent snapshot of it to disk, without locking the whole database while we do it?</p>
+<p>Redis famously solves this at the OS level, using the <code>fork()</code> system call and copy-on-write virtual memory pages. ClickHouse Keeper does it completely in user space. It takes non-blocking snapshots using two simple data structures: a doubly linked list and a hash map. In this post, we’ll look at how that works, and then find it in the ClickHouse source code.</p>
+<p>Prefer video? Here’s the same walkthrough:</p>
+<div class="quarto-video ratio ratio-16x9"><iframe data-external="1" src="https://www.youtube.com/embed/7J93WKEFinA" title="" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen=""></iframe></div>
+<hr>
+<section id="why-the-simple-approaches-dont-work" class="level3">
+<h3 class="anchored" data-anchor-id="why-the-simple-approaches-dont-work">Why the simple approaches don’t work</h3>
+<p>There are two brute-force ways to take a snapshot, and neither really works for us:</p>
+<ol type="1">
+<li><strong>Hold a global lock while writing to disk.</strong> Every client write waits until the snapshot is done, which could take seconds.</li>
+<li><strong>Deep-copy the whole map in memory</strong>, and let a background thread write the copy to disk. Now we’re using double the memory. And usually only a small fraction of the keys change while the snapshot is being written, so most of that copying is wasted.</li>
+</ol>
+<p>So what ClickHouse Keeper needs is a data structure with three properties:</p>
+<ol type="1">
+<li>Constant-time lookups, for the clients reading the data.</li>
+<li>No locking, or if that’s not possible, locking only for a very short time.</li>
+<li>Copy-on-write only for the keys that change. That way, the extra memory we use is proportional to the number of writes during the snapshot.</li>
+</ol>
+<hr>
+</section>
+<section id="why-not-a-plain-hash-map" class="level3">
+<h3 class="anchored" data-anchor-id="why-not-a-plain-hash-map">Why not a plain hash map?</h3>
+<p>The obvious question is: why can’t we do this with a regular hash map, like <code>std::unordered_map</code> in C++?</p>
+<p>The problem is that as writes keep arriving during a snapshot, the hash map will eventually need to grow and <strong>rehash</strong>. Rehashing moves keys into different buckets, so the order of the keys gets scrambled. If the snapshot thread is walking through the buckets while that happens, it can miss some keys and write others twice.</p>
+<p>We need a structure that gives us constant-time lookups, but also a stable, predictable order to walk through.</p>
+<hr>
+</section>
+<section id="a-hash-map-and-a-doubly-linked-list" class="level3">
+<h3 class="anchored" data-anchor-id="a-hash-map-and-a-doubly-linked-list">A hash map and a doubly linked list</h3>
+<p>To get both, we can combine two data structures we already know:</p>
+<ol type="1">
+<li>A <strong>hash map</strong> for constant-time lookups.</li>
+<li>A <strong>doubly linked list</strong> that keeps a stable insertion order.</li>
+</ol>
+<p>The key-value data actually lives in the nodes of the linked list. The hash map stores the keys, and each key’s value is a pointer to that key’s node in the list.</p>
+<p><img src="https://thewalstreetjournal.github.io/posts/clickhouse-keeper-non-blocking-snapshots/hashmap-and-list.png" class="img-fluid" alt="A hash map with keys alice, bob and carol, each pointing to a node in a doubly linked list holding 30, 25 and 35."></p>
+<p>Let’s look at how this behaves in two cases: during normal operation, when no snapshot is running, and while a snapshot is being taken.</p>
+<section id="normal-operation" class="level4">
+<h4 class="anchored" data-anchor-id="normal-operation">Normal operation</h4>
+<p>When there’s no snapshot running, everything is straightforward, and every operation is O(1):</p>
+<ul>
+<li><strong>Insert <code>dave</code>:</strong> look up <code>dave</code> in the hash map. It isn’t there, so append a new node at the tail of the list, and store a pointer to it in the hash map.</li>
+<li><strong>Update <code>dave</code> to 45:</strong> look up <code>dave</code>, follow the pointer to its node, and change the value in place.</li>
+<li><strong>Delete <code>bob</code>:</strong> look up <code>bob</code>, unlink its node from the list, and remove the key from the hash map.</li>
+</ul>
+</section>
+<section id="during-a-snapshot" class="level4">
+<h4 class="anchored" data-anchor-id="during-a-snapshot">During a snapshot</h4>
+<p>Here’s the idea. The snapshot thread starts at the head of the list and walks it node by node, writing each node to disk, without holding any lock. At the moment the snapshot starts, the list has some fixed number of nodes. Let’s call it <strong>N</strong>. We can think of this as a <strong>cut-off line</strong>.</p>
+<p>If we can guarantee that every write that arrives after the snapshot starts only ever touches the list <em>after</em> this cut-off line, the snapshot thread can safely walk the first N nodes while writes carry on.</p>
+<p>To start a snapshot, we record N and turn on a “snapshot mode” flag. Both must happen together, so we take a lock for that tiny moment, record the two values, and release it. Reads and writes are blocked only for those few instructions.</p>
+<p><img src="https://thewalstreetjournal.github.io/posts/clickhouse-keeper-non-blocking-snapshots/snapshot-cutoff.png" class="img-fluid" alt="Snapshot mode is on. A cut-off line is drawn after the third node, N = 3. New writes go after the line."></p>
+<p>Now the operations behave like this:</p>
+<ul>
+<li><strong>Insert:</strong> nothing changes. New nodes are always appended at the tail, which is after the cut-off line anyway.</li>
+<li><strong>Update:</strong> if the node is <em>before</em> the cut-off line, we can’t change it, because the snapshot thread may not have written it yet. So we mark the old node as <strong>inactive</strong>, append a copy with the new value at the tail, and point the hash map at the copy. That’s the copy-on-write, and readers see the new value straight away. If the same key is updated again, its node is now after the cut-off line, so it’s simply changed in place.</li>
+</ul>
+<p><img src="https://thewalstreetjournal.github.io/posts/clickhouse-keeper-non-blocking-snapshots/snapshot-update-cow.png" class="img-fluid" alt="update('bob', 27) during a snapshot: bob's old node 25 is marked inactive and stays before the cut-off line, and bob now points to a new node 27 after the line."></p>
+<ul>
+<li><strong>Delete:</strong> we remove the key from the hash map, but we leave its node in the list, marked as inactive. If it’s before the cut-off line, the snapshot thread still has to write it.</li>
+</ul>
+<p><img src="https://thewalstreetjournal.github.io/posts/clickhouse-keeper-non-blocking-snapshots/snapshot-delete.png" class="img-fluid" alt="delete('carol') during a snapshot: carol is removed from the hash map, but her node 35 stays in the list marked inactive."></p>
+<p>When the snapshot has written all N nodes, there’s a quick cleanup. We take a brief lock, go through only the nodes marked inactive, remove them from the list, and turn snapshot mode off.</p>
+<p><img src="https://thewalstreetjournal.github.io/posts/clickhouse-keeper-non-blocking-snapshots/after-snapshot.png" class="img-fluid" alt="After the snapshot: the inactive nodes are removed, leaving 30, 40 and 27 in the list."></p>
+<p>That’s the whole design. Writes after the cut-off line are invisible to the snapshot, and only the keys that change get copied. Lookups stay O(1), the lock is held only for a moment at the start and the end, and the extra memory is proportional to the writes during the snapshot. It hits every item on the wishlist.</p>
+<p>I find it pretty cool how two simple data structures, put together, solve what looks like a hard problem.</p>
+<hr>
+</section>
+</section>
+<section id="in-the-source-code" class="level3">
+<h3 class="anchored" data-anchor-id="in-the-source-code">In the source code</h3>
+<p><a href="https://github.com/ClickHouse/ClickHouse">ClickHouse</a> is an open-source OLAP database. It has its own implementation of ZooKeeper, called ClickHouse Keeper, and that’s what we’ve been looking at. The code below is from the <a href="https://github.com/ClickHouse/ClickHouse/tree/v26.2.1.1139-stable/src/Coordination">v26.2.1.1139-stable</a> release.</p>
+<section id="the-two-structures" class="level4">
+<h4 class="anchored" data-anchor-id="the-two-structures">The two structures</h4>
+<p>Everything lives in <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/SnapshotableHashTable.h#L86-L95"><code>SnapshotableHashTable.h</code></a>:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1" style="background: #f1f3f5;"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb1-1"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">using</span> List <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> <span class="bu" style="color: null;
+background-color: null;
+font-style: inherit;">std::</span>list<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&lt;</span>ListElem<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&gt;;</span></span>
+<span id="cb1-2"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">using</span> Mapped <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">typename</span> List<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">::</span>iterator<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb1-3"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">using</span> IndexMap <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> HashMap<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&lt;</span><span class="bu" style="color: null;
+background-color: null;
+font-style: inherit;">std::</span>string_view<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> Mapped<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&gt;;</span></span>
+<span id="cb1-4"></span>
+<span id="cb1-5">List list<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb1-6">IndexMap map<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb1-7"><span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">bool</span> snapshot_mode<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">false</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">};</span></span>
+<span id="cb1-8"><span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/// Allows to avoid additional copies in updateValue function</span></span>
+<span id="cb1-9"><span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">size_t</span> current_version<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span><span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">0</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">};</span></span>
+<span id="cb1-10"><span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">size_t</span> snapshot_up_to_version<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span><span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">0</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">};</span></span></code></pre></div></div>
+<p>There are the two structures: a <code>std::list</code>, which is a doubly linked list, and a hash map whose values are iterators into that list. Then there’s the snapshot mode flag, and two version numbers.</p>
+<p>Each node in the list is a <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/SnapshotableHashTable.h#L15-L25"><code>ListNode</code></a>. It holds the key, the value, and some metadata packed into a single 64-bit field:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2" style="background: #f1f3f5;"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb2-1"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">struct</span></span>
+<span id="cb2-2"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb2-3">    <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">uint64_t</span> active_in_map <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">:</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">1</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb2-4">    <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">uint64_t</span> free_key <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">:</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">1</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb2-5">    <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">uint64_t</span> version <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">:</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">62</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb2-6"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span> node_metadata<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">false</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">false</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">0</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">};</span></span></code></pre></div></div>
+<p><code>active_in_map</code> is the active/inactive flag from earlier. <code>version</code> is how ClickHouse knows which side of the cut-off line a node is on. Every node records the table’s <code>current_version</code> at the time it was written. When a snapshot starts, the current version becomes <code>snapshot_up_to_version</code>, and <code>current_version</code> is bumped by one ( <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/SnapshotableHashTable.h#L388-L393"><code>enableSnapshotMode</code></a> ). So any node with <code>version &lt;= snapshot_up_to_version</code> is before the cut-off line, and anything written after the snapshot started is after it.</p>
+</section>
+<section id="starting-a-snapshot-the-short-lock" class="level4">
+<h4 class="anchored" data-anchor-id="starting-a-snapshot-the-short-lock">Starting a snapshot: the short lock</h4>
+<p>The snapshot starts in <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/KeeperStateMachine.cpp#L823-L826"><code>KeeperStateMachine.cpp</code></a>, the Raft state machine. The comment says exactly what we described:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3" style="background: #f1f3f5;"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb3-1"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span> <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/// lock storage for a short period time to turn on "snapshot mode". After that we can read consistent storage state without locking.</span></span>
+<span id="cb3-2">    LockGuardWithStats<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&lt;</span><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">false</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&gt;</span> lock<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>storage_mutex<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb3-3">    snapshot_task<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>snapshot <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> <span class="bu" style="color: null;
+background-color: null;
+font-style: inherit;">std::</span>make_shared<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&lt;</span>KeeperStorageSnapshot<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&lt;</span>Storage<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&gt;&gt;(</span>storage<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>get<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(),</span> snapshot_meta_copy<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> getClusterConfig<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">());</span></span>
+<span id="cb3-4"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span></span></code></pre></div></div>
+<p>The lock is scoped, so it’s released as soon as the block ends. Inside, the snapshot object is created. Its constructor, in <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/KeeperSnapshotManager.cpp#L615-L618"><code>KeeperSnapshotManager.cpp</code></a>, records N and turns on snapshot mode:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4" style="background: #f1f3f5;"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb4-1"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">auto</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">[</span>size<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> ver<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">]</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> storage<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-&gt;</span>container<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>snapshotSizeWithVersion<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">();</span></span>
+<span id="cb4-2">snapshot_container_size <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> size<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span>          <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">// this is N</span></span>
+<span id="cb4-3">storage<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-&gt;</span>enableSnapshotMode<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>ver<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span>        <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">// the flag, and the cut-off version</span></span>
+<span id="cb4-4">begin <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> storage<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-&gt;</span>getSnapshotIteratorBegin<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">();</span></span></code></pre></div></div>
+</section>
+<section id="writes-during-the-snapshot" class="level4">
+<h4 class="anchored" data-anchor-id="writes-during-the-snapshot">Writes during the snapshot</h4>
+<p>Back in <code>SnapshotableHashTable.h</code>, <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/SnapshotableHashTable.h#L210"><code>insert</code></a> doesn’t care about snapshot mode at all. It just appends to the list and adds the key to the map.</p>
+<p><a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/SnapshotableHashTable.h#L297-L343"><code>updateValue</code></a> is where the copy-on-write happens:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5" style="background: #f1f3f5;"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb5-1"><span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">if</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>snapshot_mode<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span></span>
+<span id="cb5-2"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb5-3">    <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/// We in snapshot mode but updating some node which is already more</span></span>
+<span id="cb5-4">    <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/// fresh than snapshot distance. So it will not participate in</span></span>
+<span id="cb5-5">    <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/// snapshot and we don't need to copy it.</span></span>
+<span id="cb5-6">    <span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">if</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>list_itr<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-&gt;</span>getVersion<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">()</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&lt;=</span> snapshot_up_to_version<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span></span>
+<span id="cb5-7">    <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb5-8">        <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">auto</span> elem_copy <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> list_itr<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-&gt;</span>copyFromSnapshotNode<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">();</span></span>
+<span id="cb5-9">        <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">...</span></span>
+<span id="cb5-10">        list_itr<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-&gt;</span>setInactiveInMap<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">();</span></span>
+<span id="cb5-11">        snapshot_invalid_iters<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>push_back<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>list_itr<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb5-12">        updater<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>elem_copy<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>value<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb5-13"></span>
+<span id="cb5-14">        elem_copy<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>setVersion<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>current_version<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb5-15">        <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">auto</span> itr <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> list<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>insert<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>list<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>end<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(),</span> <span class="bu" style="color: null;
+background-color: null;
+font-style: inherit;">std::</span>move<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>elem_copy<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">));</span></span>
+<span id="cb5-16">        it<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-&gt;</span>getMapped<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">()</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> itr<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb5-17">        <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">...</span></span>
+<span id="cb5-18">    <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span></span>
+<span id="cb5-19">    <span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">else</span></span>
+<span id="cb5-20">    <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb5-21">        updater<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>list_itr<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-&gt;</span>value<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb5-22">        <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">...</span></span>
+<span id="cb5-23">    <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span></span>
+<span id="cb5-24"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span></span></code></pre></div></div>
+<p>If the node is before the cut-off line, it’s marked inactive, a copy with the new value is appended at the end, and the map is pointed at the copy. Otherwise, it’s updated in place.</p>
+<p><a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/SnapshotableHashTable.h#L266-L290"><code>erase</code></a> follows the same pattern. In snapshot mode, it marks the node inactive and removes the key from the map, but it does not remove the node from the list. Outside snapshot mode, it removes both.</p>
+<p>Notice <code>snapshot_invalid_iters</code>. Every node that becomes inactive is added to this list, so that the cleanup doesn’t have to walk the whole linked list to find them.</p>
+</section>
+<section id="writing-the-snapshot-and-cleaning-up" class="level4">
+<h4 class="anchored" data-anchor-id="writing-the-snapshot-and-cleaning-up">Writing the snapshot and cleaning up</h4>
+<p>The snapshot itself is written by a background task, created right after the short lock in <code>KeeperStateMachine.cpp</code>. Depending on where the snapshot is going, it calls <code>serializeSnapshotToDisk</code> or <code>serializeSnapshotBufferToDisk</code>. Both end up in <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/KeeperSnapshotManager.cpp#L260-L264"><code>serialize</code></a>, which walks exactly N nodes from the start of the list:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6" style="background: #f1f3f5;"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb6-1"><span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">for</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">auto</span> it <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> snapshot<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>begin<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span> counter <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&lt;</span> snapshot<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>snapshot_container_size<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">++</span>counter<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span></span></code></pre></div></div>
+<p>When it’s done, the cleanup takes the storage lock again, very briefly ( <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/KeeperStateMachine.cpp#L888-L894">L888–L894</a> ):</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb7" style="background: #f1f3f5;"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb7-1"><span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/// Destroy snapshot with lock</span></span>
+<span id="cb7-2">LockGuardWithStats<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&lt;</span><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">false</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&gt;</span> lock<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>storage_mutex<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb7-3"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">...</span></span>
+<span id="cb7-4"><span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/// Turn off "snapshot mode" and clear outdate part of storage state</span></span>
+<span id="cb7-5">storage<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-&gt;</span>clearGarbageAfterSnapshot<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">();</span></span>
+<span id="cb7-6"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">...</span></span>
+<span id="cb7-7">snapshot<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>reset<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">();</span></span></code></pre></div></div>
+<p><code>clearGarbageAfterSnapshot</code> calls <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/SnapshotableHashTable.h#L364-L376"><code>clearOutdatedNodes</code></a>, which goes through <code>snapshot_invalid_iters</code> and erases those nodes from the list. Resetting the snapshot runs its <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/KeeperSnapshotManager.cpp#L624-L628">destructor</a>, which turns snapshot mode off.</p>
+<hr>
+</section>
+</section>
+<section id="summary" class="level3">
+<h3 class="anchored" data-anchor-id="summary">Summary</h3>
+<p>We wanted to snapshot a large in-memory hash map to disk without blocking writes. ClickHouse Keeper does it with two simple data structures: a hash map for constant-time lookups, and a doubly linked list where the data actually lives.</p>
+<p>When a snapshot starts, it marks a cut-off line in the list. After that, new and updated values go after the line, and deleted or replaced nodes stay in the list, marked inactive. The snapshot thread writes the first N nodes without blocking anyone, and a quick cleanup at the end removes the inactive nodes.</p>
+<hr>
+</section>
+<section id="credits-and-resources" class="level3">
+<h3 class="anchored" data-anchor-id="credits-and-resources">Credits and Resources</h3>
+<p>For this post, I have heavily used Claude Code. Along with that, I have relied on the following resources:</p>
+<ol type="1">
+<li><a href="https://clickhouse.com/docs/guides/sre/keeper/clickhouse-keeper">ClickHouse Keeper</a>, ClickHouse docs</li>
+<li><a href="https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/">Redis persistence</a>, for how Redis uses <code>fork()</code> for snapshots</li>
+<li><a href="https://github.com/ClickHouse/ClickHouse/tree/v26.2.1.1139-stable/src/Coordination">ClickHouse source code, v26.2.1.1139-stable</a></li>
+</ol>
+<hr>
+
+
+</section>
+
+ ]]></description>
+  <category>clickhouse</category>
+  <category>internals</category>
+  <guid>https://thewalstreetjournal.github.io/posts/clickhouse-keeper-non-blocking-snapshots/</guid>
+  <pubDate>Tue, 06 Oct 2026 18:30:00 GMT</pubDate>
+  <media:content url="https://thewalstreetjournal.github.io/posts/clickhouse-keeper-non-blocking-snapshots/snapshot-update-cow.png" medium="image" type="image/png" height="81" width="144"/>
+</item>
 <item>
   <title>How the Postgres Free Space Map Works</title>
   <link>https://thewalstreetjournal.github.io/posts/postgres-free-space-map/</link>
