@@ -10,7 +10,435 @@
 <atom:link href="https://thewalstreetjournal.github.io/index.xml" rel="self" type="application/rss+xml"/>
 <description>Database internals, read from the source code.</description>
 <generator>quarto-1.8.26</generator>
-<lastBuildDate>Sat, 28 Mar 2026 18:30:00 GMT</lastBuildDate>
+<lastBuildDate>Sun, 07 Jun 2026 18:30:00 GMT</lastBuildDate>
+<item>
+  <title>How the Postgres Free Space Map Works</title>
+  <link>https://thewalstreetjournal.github.io/posts/postgres-free-space-map/</link>
+  <description><![CDATA[ 
+
+
+
+
+
+
+<p>Postgres stores data on disk in 8KB pages. Every time we insert a row, postgres has to find a page with enough free space to fit that row. That’s easy when the table is small. But a 100GB table has around 13 million pages, and the free space in each of them keeps changing as rows are inserted and deleted. So how does postgres find a page for the new row so quickly?</p>
+<p>The answer is a data structure called the <strong>Free Space Map</strong> ( FSM ). In this post, we’ll build it up step by step and see how Postgres implements it.</p>
+<p>Prefer video? Here’s the same walkthrough:</p>
+<div class="quarto-video ratio ratio-16x9"><iframe data-external="1" src="https://www.youtube.com/embed/ZKMLQ5BFrCw" title="" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen=""></iframe></div>
+<hr>
+<section id="the-wishlist" class="level3">
+<h3 class="anchored" data-anchor-id="the-wishlist">The wishlist</h3>
+<p>Before looking at what postgres does, let’s write down what we want from this data structure.</p>
+<p><strong>1. Search and update should be fast.</strong> Before inserting a row, we search for a page with enough free space. After the insert, we update that page’s free space. Both of these happen on every insert, so both should be something like O(log n).</p>
+<p><strong>2. Finding the maximum free space should be instant.</strong> If even the page with the maximum free space can’t accommodate our row, there’s no point searching through the other pages. We should immediately give up and add a new, empty page to the table. So checking the maximum free space size has to be O(1).</p>
+<p><strong>3. Inserts should be spread across pages.</strong> This one is a bit nuanced. Say we did the simplest thing: go through the pages one by one and pick the first one with enough room. If page 3 has a lot of free space, the first insert goes to page 3. So does the second, and the third.</p>
+<p><img src="https://thewalstreetjournal.github.io/posts/postgres-free-space-map/fsm-wishlist-inserts.png" class="img-fluid" alt="Five pages. Pages 1 and 2 are full, pages 3, 4 and 5 have free space. Inserts 1, 2 and 3 all go to page 3."></p>
+<p>Every insert adds onto the same page. That’s bad for performance, because all those inserts end up fighting over the same page. If pages 3, 4 and 5 all have room, we’d rather send one insert to each of them.</p>
+<p>So the wishlist is:</p>
+<ol type="1">
+<li>Search and update in O(log n).</li>
+<li>Find the maximum free space in O(1).</li>
+<li>Spread the inserts evenly.</li>
+</ol>
+<hr>
+</section>
+<section id="a-max-heap" class="level3">
+<h3 class="anchored" data-anchor-id="a-max-heap">A Max-Heap</h3>
+<p>There is one data structure that already gives us the first two: a <strong>max-heap</strong>.</p>
+<p>The heap nodes store the free space of each page, one heap node per page. Every internal node stores the maximum of its two children. So the root always holds the largest free space across all pages ( that’s our O(1) maximum ), and searching or updating means walking one path from the root to a leaf or back up ( that’s O(log n) ).</p>
+<p>So how do we now spread the inserts evenly? For this, postgres implements a <strong>round-robin</strong> search:</p>
+<ul>
+<li>The search starts at a leaf, not at the root.</li>
+<li>Postgres remembers where the last search ended, in a variable called <code>next_slot</code>. The next search starts from there, and only moves to the right ( wrapping around at the end ).</li>
+</ul>
+<p>The search itself has two phases:</p>
+<ol type="1">
+<li><strong>Climb.</strong> Starting from the <code>next_slot</code> leaf, check if the current node has enough free space. If not, move one node to the right, then climb up to its parent. Repeat until you reach a node with enough space.</li>
+<li><strong>Descend.</strong> Treat that node as the root and walk down like a normal heap search, preferring the left child whenever it has enough space, until you reach a leaf.</li>
+</ol>
+<p>Moving right-then-up means we only ever look to the right of where we started, and the area we cover doubles with each step. So we still find a page in O(log n), but each search starts where the last one stopped, and the inserts spread out across pages.</p>
+<p>Let’s do a dry run on this tree. The leaves are the free spaces of 8 pages, numbered 0 to 7:</p>
+<p><img src="https://thewalstreetjournal.github.io/posts/postgres-free-space-map/fsm-search-tree.png" class="img-fluid" alt="A max-heap with leaves 5, 10, 7, 20, 5, 35, 11, 40. The level above has 10, 20, 35, 40, then 20 and 40, and the root is 40."></p>
+<p><strong>Search(8)</strong>, with <code>next_slot = 0</code>:</p>
+<ul>
+<li>Start at leaf 0, which has 5. Not enough.</li>
+<li>Move right to leaf 1 and climb to its parent, which has 10. That’s enough, so the climb stops.</li>
+<li>Descend from 10: the left child has 5 ( not enough ), the right child has 10. That’s leaf 1.</li>
+<li>Return page 1, and set <code>next_slot = 2</code>.</li>
+</ul>
+<p><strong>Search(25)</strong>, with <code>next_slot = 2</code>:</p>
+<ul>
+<li>Start at leaf 2, which has 7. Not enough.</li>
+<li>Move right to leaf 3 and climb to its parent, which has 20. Still not enough.</li>
+<li>Move right to the node with 35 and climb to its parent, which has 40. That’s enough.</li>
+<li>Descend from 40: the left child has 35, which is enough, so go left. From 35: the left child has 5, the right child has 35. That’s leaf 5.</li>
+<li>Return page 5, and set <code>next_slot = 6</code>.</li>
+</ul>
+<p>Notice that the second search never looked at pages 0 or 1. It started where the first one stopped.</p>
+<hr>
+</section>
+<section id="from-one-page-to-millions" class="level3">
+<h3 class="anchored" data-anchor-id="from-one-page-to-millions">From one page to millions</h3>
+<p>There is one more problem. This max-heap has to live on disk, and everything postgres stores on disk lives in 8KB pages. One 8KB page can hold the max-heap for about 4,000 data pages. That’s nowhere near the millions of pages we want to handle.</p>
+<p>So postgres splits the heap across many pages and arranges those pages as a tree too. Each FSM page holds its own small max-heap. The leaves of a top-level FSM page don’t describe data pages. Each leaf holds the root value of a child FSM page one level below. Only the leaves of the bottom-level FSM pages hold the free space of the actual data pages.</p>
+<p><img src="https://thewalstreetjournal.github.io/posts/postgres-free-space-map/fsm-three-levels.png" class="img-fluid" alt="Three levels of FSM pages. Each FSM page contains a small max-heap. The leaves of the root page match the roots of the level-1 pages, and the leaves of level-1 pages match the roots of the bottom-level pages."></p>
+<p>So we have a tree of FSM pages, and inside each FSM page there is a max-heap. Put together, it’s still one big max-heap.</p>
+<p>The search changes a little:</p>
+<ol type="1">
+<li>Start at the root FSM page and go down level by level.</li>
+<li>Inside each FSM page, run the same climb-and-descend search. It tells us which child page to read next. At the bottom level, it tells us which data page to use.</li>
+</ol>
+<p>For every search, postgres reads exactly three FSM pages: the root, one page from the middle level, and one from the bottom level.</p>
+<p>How far does this scale? With 8KB pages, each FSM page has room for 4,069 leaves. Three levels give us 4,069 × 4,069 × 4,069, about 67 billion pages. That’s more than the roughly 4 billion pages a single postgres table can have anyway. So reading 3 FSM pages is enough to find room for a row, even in the biggest table postgres supports.</p>
+<p>To summarise: when we insert a row, postgres checks the root of the FSM. If even the biggest free space isn’t enough, it adds a new page to the table. Otherwise, it walks down the three levels of the FSM, doing a round-robin search inside each FSM page, and ends up at a data page with enough room.</p>
+<hr>
+</section>
+<section id="prerequisites" class="level3">
+<h3 class="anchored" data-anchor-id="prerequisites">Prerequisites</h3>
+<p>I’m using the same postgres container as the earlier posts. The Dockerfile is on <a href="https://github.com/thewalstreetjournal/postgres-playlist/tree/main/003-fsm-data-structure">GitHub</a>. The <code>pg_freespacemap</code> extension we’ll use is included in the official postgres image.</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1" style="background: #f1f3f5;"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb1-1"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">docker</span> build <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-t</span> postgres-17.6:v1 .</span>
+<span id="cb1-2"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">docker</span> network create pgnet</span>
+<span id="cb1-3"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">docker</span> run <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-d</span> <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">--name</span> postgres <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">--network</span> pgnet <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-e</span> POSTGRES_PASSWORD=secret postgres-17.6:v1</span>
+<span id="cb1-4"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">docker</span> exec <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-it</span> postgres bash</span></code></pre></div></div>
+<p>I keep two terminals open inside the container: one for <code>psql -U postgres</code> and one for looking at the files.</p>
+<hr>
+</section>
+<section id="the-fsm-in-the-terminal" class="level3">
+<h3 class="anchored" data-anchor-id="the-fsm-in-the-terminal">The FSM in the terminal</h3>
+<p>Let’s switch to a test database and create a table:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2" style="background: #f1f3f5;"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb2-1"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">CREATE</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">DATABASE</span> dummy;</span>
+<span id="cb2-2">\c dummy</span>
+<span id="cb2-3"></span>
+<span id="cb2-4"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">CREATE</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">TABLE</span> items (<span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">id</span> serial, <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">data</span> text);</span>
+<span id="cb2-5"></span>
+<span id="cb2-6"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">SELECT</span> pg_relation_filepath(<span class="st" style="color: #20794D;
+background-color: null;
+font-style: inherit;">'items'</span>);</span></code></pre></div></div>
+<pre><code> pg_relation_filepath
+----------------------
+ base/16386/16388</code></pre>
+<p>The FSM is stored per table, right next to the table’s data file. In the other terminal:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4" style="background: #f1f3f5;"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb4-1"><span class="bu" style="color: null;
+background-color: null;
+font-style: inherit;">cd</span> <span class="va" style="color: #111111;
+background-color: null;
+font-style: inherit;">$PGDATA</span></span>
+<span id="cb4-2"><span class="fu" style="color: #4758AB;
+background-color: null;
+font-style: inherit;">ls</span> <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-l</span> base/16386 <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">|</span> <span class="fu" style="color: #4758AB;
+background-color: null;
+font-style: inherit;">grep</span> 16388</span></code></pre></div></div>
+<pre><code>-rw------- 1 postgres postgres     0 ... 16388</code></pre>
+<p>There’s just the data file, and it’s empty: zero bytes, because we haven’t inserted anything yet. There is no FSM file. Postgres is lazy about the FSM. It won’t create it until it needs it.</p>
+<p>Let’s insert enough rows to fill a few pages:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6" style="background: #f1f3f5;"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb6-1"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">INSERT</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">INTO</span> items (<span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">data</span>)</span>
+<span id="cb6-2"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">SELECT</span> repeat(<span class="st" style="color: #20794D;
+background-color: null;
+font-style: inherit;">'x'</span>, <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">200</span>) <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">FROM</span> generate_series(<span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">1</span>, <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">200</span>);</span></code></pre></div></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb7" style="background: #f1f3f5;"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb7-1"><span class="fu" style="color: #4758AB;
+background-color: null;
+font-style: inherit;">ls</span> <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-l</span> base/16386 <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">|</span> <span class="fu" style="color: #4758AB;
+background-color: null;
+font-style: inherit;">grep</span> 16388</span></code></pre></div></div>
+<pre><code>-rw------- 1 postgres postgres 49152 ... 16388
+-rw------- 1 postgres postgres 24576 ... 16388_fsm</code></pre>
+<p>The table now has 6 pages ( 49152 / 8192 ), and a new file, <code>16388_fsm</code>, has appeared. It’s 24KB, which is 3 pages. That’s what we’d expect: the root FSM page, one page at the middle level, and one page at the bottom level. These pages are stored in the file depth-first. So if the table grows enough to need a second bottom-level page, it goes right after the first one.</p>
+<p>We won’t decode the raw bytes this time. Instead, postgres has an extension that reads the FSM for us:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb9" style="background: #f1f3f5;"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb9-1"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">CREATE</span> EXTENSION <span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">IF</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">NOT</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">EXISTS</span> pg_freespacemap;</span>
+<span id="cb9-2"></span>
+<span id="cb9-3"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">SELECT</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">*</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">FROM</span> pg_freespace(<span class="st" style="color: #20794D;
+background-color: null;
+font-style: inherit;">'items'</span>);</span></code></pre></div></div>
+<pre><code> blkno | avail
+-------+-------
+     0 |   128
+     1 |   128
+     2 |   128
+     3 |   128
+     4 |   128
+     5 |     0</code></pre>
+<p>Each row is 200 x’s plus some headers, so 34 of them fit in a page. The first five pages are nearly full, with only 128 bytes left. The last page says 0, but it isn’t actually full: it only has 30 rows. Postgres records a page’s free space in the FSM when it moves on from that page, and we never moved on from the last one.</p>
+<p>Now let’s delete half the rows:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb11" style="background: #f1f3f5;"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb11-1"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">DELETE</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">FROM</span> items <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">WHERE</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">id</span> % <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">2</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">0</span>;</span>
+<span id="cb11-2"></span>
+<span id="cb11-3"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">SELECT</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">*</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">FROM</span> pg_freespace(<span class="st" style="color: #20794D;
+background-color: null;
+font-style: inherit;">'items'</span>);</span></code></pre></div></div>
+<pre><code> blkno | avail
+-------+-------
+     0 |   128
+     1 |   128
+     2 |   128
+     3 |   128
+     4 |   128
+     5 |     0</code></pre>
+<p>Nothing changed. Postgres is lazy here too. A <code>DELETE</code> only marks the rows as deleted. The space is reclaimed later by <code>VACUUM</code>, which also updates the FSM. We can run it ourselves:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb13" style="background: #f1f3f5;"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb13-1">VACUUM items;</span>
+<span id="cb13-2"></span>
+<span id="cb13-3"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">SELECT</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">*</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">FROM</span> pg_freespace(<span class="st" style="color: #20794D;
+background-color: null;
+font-style: inherit;">'items'</span>);</span></code></pre></div></div>
+<pre><code> blkno | avail
+-------+-------
+     0 |  4064
+     1 |  4064
+     2 |  4064
+     3 |  4064
+     4 |  4064
+     5 |  4544</code></pre>
+<p>Now every page is about half empty, which matches the half of the rows we deleted. If you list the files again, you’ll also see a <code>16388_vm</code> file. That’s the visibility map, which <code>VACUUM</code> creates. It isn’t in the scope of this post.</p>
+<hr>
+</section>
+<section id="in-the-source-code" class="level3">
+<h3 class="anchored" data-anchor-id="in-the-source-code">In the source code</h3>
+<p>The FSM code lives in <a href="https://github.com/postgres/postgres/tree/REL_17_6/src/backend/storage/freespace"><code>src/backend/storage/freespace</code></a>. The <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/storage/freespace/README">README</a> there is a very readable description of the whole design.</p>
+<p>The search inside one FSM page is <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/storage/freespace/fsmpage.c#L158"><code>fsm_search_avail</code> in <code>fsmpage.c</code></a>. The climb is just a few lines ( <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/storage/freespace/fsmpage.c#L227-L238">L227–L238</a> ):</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb15" style="background: #f1f3f5;"><pre class="sourceCode c code-with-copy"><code class="sourceCode c"><span id="cb15-1">nodeno <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> target<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb15-2"><span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">while</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>nodeno <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&gt;</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">0</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span></span>
+<span id="cb15-3"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb15-4">    <span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">if</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>fsmpage<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-&gt;</span>fp_nodes<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">[</span>nodeno<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">]</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&gt;=</span> minvalue<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span></span>
+<span id="cb15-5">        <span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">break</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb15-6"></span>
+<span id="cb15-7">    <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/*</span></span>
+<span id="cb15-8"><span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">     * Move to the right, wrapping around on same level if necessary, then</span></span>
+<span id="cb15-9"><span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">     * climb up.</span></span>
+<span id="cb15-10"><span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">     */</span></span>
+<span id="cb15-11">    nodeno <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> parentof<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>rightneighbor<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>nodeno<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">));</span></span>
+<span id="cb15-12"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span></span></code></pre></div></div>
+<p>After the descend, it updates the start point for the next search ( <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/storage/freespace/fsmpage.c#L303">L303</a> ):</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb16" style="background: #f1f3f5;"><pre class="sourceCode c code-with-copy"><code class="sourceCode c"><span id="cb16-1">fsmpage<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-&gt;</span>fp_next_slot <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> slot <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">+</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>advancenext <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">?</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">1</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">:</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">0</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span></code></pre></div></div>
+<p>Going down the three levels happens in <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/storage/freespace/freespace.c#L678"><code>fsm_search</code> in <code>freespace.c</code></a>. It reads one FSM page per level and calls <code>fsm_search_avail</code> on it. One small detail there: <code>advancenext</code> is only true at the bottom level ( <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/storage/freespace/freespace.c#L697">L697</a> ). So it’s the bottom-level pages, the ones pointing at real data pages, that move their <code>next_slot</code> forward and spread the inserts.</p>
+<hr>
+</section>
+<section id="what-i-left-out" class="level3">
+<h3 class="anchored" data-anchor-id="what-i-left-out">What I left out</h3>
+<ul>
+<li><strong>Quantization.</strong> Postgres doesn’t store the exact free space of a page. It stores one byte per page: 256 categories of 32 bytes each ( <code>FSM_CATEGORIES</code> and <code>FSM_CAT_STEP</code> in <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/storage/freespace/freespace.c#L64-L65"><code>freespace.c</code></a> ). The exact free space would need 13 bits. Postgres rounds the available space down and the requested space up, so it never sends a row to a page that can’t fit it. That’s why we saw neat numbers like 128 and 4064 above.</li>
+<li><strong>The FSM is not WAL-logged.</strong> It’s treated as a hint. If it’s wrong after a crash, that’s fine: searches detect and fix broken FSM pages, and <code>VACUUM</code> rewrites the correct values.</li>
+<li><strong>The FSM can be stale.</strong> It’s mostly updated by <code>VACUUM</code>, and by inserts that find a page full and move on. So a page can have more ( or less ) room than the FSM says. If an insert lands on a page that’s actually full, it records the real value and searches again.</li>
+<li><strong>The tree depth.</strong> The three levels are a compile-time constant ( <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/storage/freespace/freespace.c#L75"><code>FSM_TREE_DEPTH</code></a> ). With very small page sizes, postgres would use four levels instead.</li>
+</ul>
+<hr>
+</section>
+<section id="credits-and-resources" class="level3">
+<h3 class="anchored" data-anchor-id="credits-and-resources">Credits and Resources</h3>
+<p>For this post, I have heavily used Claude Code. Along with that, I have relied on the following resources:</p>
+<ol type="1">
+<li><a href="https://www.postgresql.org/docs/17/storage-fsm.html">Free Space Map</a>, PostgreSQL docs</li>
+<li><a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/storage/freespace/README">The FSM README</a> in the postgres source</li>
+<li><a href="https://github.com/postgres/postgres/tree/REL_17_6">Postgres Source Code</a></li>
+</ol>
+<hr>
+
+
+</section>
+
+ ]]></description>
+  <category>postgres</category>
+  <category>internals</category>
+  <guid>https://thewalstreetjournal.github.io/posts/postgres-free-space-map/</guid>
+  <pubDate>Sun, 07 Jun 2026 18:30:00 GMT</pubDate>
+  <media:content url="https://thewalstreetjournal.github.io/posts/postgres-free-space-map/fsm-three-levels.png" medium="image" type="image/png" height="91" width="144"/>
+</item>
 <item>
   <title>How Does Postgres Store Data on Disk?</title>
   <link>https://thewalstreetjournal.github.io/posts/how-postgres-stores-data/</link>

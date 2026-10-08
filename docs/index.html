@@ -151,15 +151,15 @@ window.Quarto = {
 <link rel="stylesheet" href="styles.css">
 <link rel="alternate" type="application/rss+xml" title="The WAL Street Journal" href="index.xml" data-external="1"><meta property="og:title" content="The WAL Street Journal">
 <meta property="og:description" content="Database internals, read from the source code.">
-<meta property="og:image" content="https://thewalstreetjournal.github.io/posts/how-postgres-handles-connections/process-per-connection.png">
+<meta property="og:image" content="https://thewalstreetjournal.github.io/posts/postgres-free-space-map/fsm-three-levels.png">
 <meta property="og:site_name" content="The WAL Street Journal">
-<meta property="og:image:height" content="720">
-<meta property="og:image:width" content="1280">
+<meta property="og:image:height" content="580">
+<meta property="og:image:width" content="915">
 <meta name="twitter:title" content="The WAL Street Journal">
 <meta name="twitter:description" content="Database internals, read from the source code.">
-<meta name="twitter:image" content="https://thewalstreetjournal.github.io/posts/how-postgres-handles-connections/process-per-connection.png">
-<meta name="twitter:image-height" content="720">
-<meta name="twitter:image-width" content="1280">
+<meta name="twitter:image" content="https://thewalstreetjournal.github.io/posts/postgres-free-space-map/fsm-three-levels.png">
+<meta name="twitter:image-height" content="580">
+<meta name="twitter:image-width" content="915">
 <meta name="twitter:card" content="summary_large_image">
 </head>
 
@@ -402,7 +402,7 @@ window.Quarto = {
 <!-- margin-sidebar -->
     <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
         
-    <h5 class="quarto-listing-category-title">Categories</h5><div class="quarto-listing-category category-default"><div class="category" data-category="">All <span class="quarto-category-count">(2)</span></div><div class="category" data-category="aW50ZXJuYWxz">internals <span class="quarto-category-count">(2)</span></div><div class="category" data-category="cG9zdGdyZXM=">postgres <span class="quarto-category-count">(2)</span></div></div></div>
+    <h5 class="quarto-listing-category-title">Categories</h5><div class="quarto-listing-category category-default"><div class="category" data-category="">All <span class="quarto-category-count">(3)</span></div><div class="category" data-category="aW50ZXJuYWxz">internals <span class="quarto-category-count">(3)</span></div><div class="category" data-category="cG9zdGdyZXM=">postgres <span class="quarto-category-count">(3)</span></div></div></div>
 <!-- main -->
 <main class="content quarto-banner-title-block column-page-left" id="quarto-document-content">
 
@@ -439,7 +439,37 @@ window.Quarto = {
     </div>
 </div>
 <div class="list quarto-listing-default">
-<div class="quarto-post image-right" data-index="0" data-categories="cG9zdGdyZXMlMkNpbnRlcm5hbHM=" data-listing-date-sort="1774722600000" data-listing-file-modified-sort="1791440622660" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="17" data-listing-word-count-sort="3269">
+<div class="quarto-post image-right" data-index="0" data-categories="cG9zdGdyZXMlMkNpbnRlcm5hbHM=" data-listing-date-sort="1780857000000" data-listing-file-modified-sort="1791443224133" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="12" data-listing-word-count-sort="2204">
+<div class="thumbnail"><a href="./posts/postgres-free-space-map/index.html" class="no-external">
+
+<img loading="lazy" src="./posts/postgres-free-space-map/fsm-three-levels.png" class="thumbnail-image">
+
+</a></div>
+<div class="body">
+<h3 class="no-anchor listing-title">
+<a href="./posts/postgres-free-space-map/index.html" class="no-external">How the Postgres Free Space Map Works</a>
+</h3>
+<div class="listing-categories">
+
+<div class="listing-category" onclick="window.quartoListingCategory('cG9zdGdyZXM='); return false;">postgres</div>
+
+<div class="listing-category" onclick="window.quartoListingCategory('aW50ZXJuYWxz'); return false;">internals</div>
+
+</div>
+<div class="delink listing-description"><a href="./posts/postgres-free-space-map/index.html" class="no-external">
+<p>Every INSERT in Postgres needs a page with enough free space for that insert. Postgres finds such a page for the insert by reading just three pages of its Free Space Map, even for a table with millions of pages.</p>
+</a></div>
+</div>
+<div class="metadata">
+<a href="./posts/postgres-free-space-map/index.html" class="no-external">
+<div class="listing-date">
+Jun 8, 2026
+</div>
+<div class="listing-reading-time">12 min</div>
+</a>
+</div>
+</div>
+<div class="quarto-post image-right" data-index="1" data-categories="cG9zdGdyZXMlMkNpbnRlcm5hbHM=" data-listing-date-sort="1774722600000" data-listing-file-modified-sort="1791440877234" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="17" data-listing-word-count-sort="3269">
 <div class="thumbnail"><a href="./posts/how-postgres-stores-data/index.html" class="no-external">
 
 <p class="card-img-top"><img src="posts/how-postgres-stores-data/segments-and-pages.png" alt="A table stored as segment files 16388, 16388.1 and 16388.2 of up to 1 GB each. The first segment is a sequence of 8 KB pages, page 0 to page 131071."  class="thumbnail-image card-img"/></p>
@@ -469,7 +499,7 @@ Mar 29, 2026
 </a>
 </div>
 </div>
-<div class="quarto-post image-right" data-index="1" data-categories="cG9zdGdyZXMlMkNpbnRlcm5hbHM=" data-listing-date-sort="1773513000000" data-listing-file-modified-sort="1791405336380" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="11" data-listing-word-count-sort="2157">
+<div class="quarto-post image-right" data-index="2" data-categories="cG9zdGdyZXMlMkNpbnRlcm5hbHM=" data-listing-date-sort="1773513000000" data-listing-file-modified-sort="1791405336380" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="11" data-listing-word-count-sort="2157">
 <div class="thumbnail"><a href="./posts/how-postgres-handles-connections/index.html" class="no-external">
 
 <img loading="lazy" src="./posts/how-postgres-handles-connections/process-per-connection.png" class="thumbnail-image">

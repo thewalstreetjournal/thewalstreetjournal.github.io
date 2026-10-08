@@ -1,19 +1,23 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
-    <loc>https://thewalstreetjournal.github.io/posts/how-postgres-stores-data/index.html</loc>
-    <lastmod>2026-10-08T06:23:42.660Z</lastmod>
+    <loc>https://thewalstreetjournal.github.io/posts/postgres-free-space-map/index.html</loc>
+    <lastmod>2026-10-08T07:07:04.133Z</lastmod>
   </url>
   <url>
-    <loc>https://thewalstreetjournal.github.io/index.html</loc>
-    <lastmod>2026-10-07T18:10:03.417Z</lastmod>
+    <loc>https://thewalstreetjournal.github.io/posts/how-postgres-handles-connections/index.html</loc>
+    <lastmod>2026-10-07T20:35:36.380Z</lastmod>
   </url>
   <url>
     <loc>https://thewalstreetjournal.github.io/about.html</loc>
     <lastmod>2026-10-07T18:18:13.230Z</lastmod>
   </url>
   <url>
-    <loc>https://thewalstreetjournal.github.io/posts/how-postgres-handles-connections/index.html</loc>
-    <lastmod>2026-10-07T20:35:36.380Z</lastmod>
+    <loc>https://thewalstreetjournal.github.io/index.html</loc>
+    <lastmod>2026-10-07T18:10:03.417Z</lastmod>
+  </url>
+  <url>
+    <loc>https://thewalstreetjournal.github.io/posts/how-postgres-stores-data/index.html</loc>
+    <lastmod>2026-10-08T06:27:57.234Z</lastmod>
   </url>
 </urlset>
