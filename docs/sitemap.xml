@@ -5,23 +5,27 @@
     <lastmod>2026-10-08T07:07:04.133Z</lastmod>
   </url>
   <url>
-    <loc>https://thewalstreetjournal.github.io/posts/how-postgres-handles-connections/index.html</loc>
-    <lastmod>2026-10-07T20:35:36.380Z</lastmod>
-  </url>
-  <url>
-    <loc>https://thewalstreetjournal.github.io/index.html</loc>
-    <lastmod>2026-10-07T18:10:03.417Z</lastmod>
-  </url>
-  <url>
-    <loc>https://thewalstreetjournal.github.io/about.html</loc>
-    <lastmod>2026-10-07T18:18:13.230Z</lastmod>
+    <loc>https://thewalstreetjournal.github.io/posts/how-postgres-stores-data/index.html</loc>
+    <lastmod>2026-10-08T06:27:57.234Z</lastmod>
   </url>
   <url>
     <loc>https://thewalstreetjournal.github.io/posts/clickhouse-keeper-non-blocking-snapshots/index.html</loc>
     <lastmod>2026-10-08T08:02:56.189Z</lastmod>
   </url>
   <url>
-    <loc>https://thewalstreetjournal.github.io/posts/how-postgres-stores-data/index.html</loc>
-    <lastmod>2026-10-08T06:27:57.234Z</lastmod>
+    <loc>https://thewalstreetjournal.github.io/about.html</loc>
+    <lastmod>2026-10-07T18:18:13.230Z</lastmod>
+  </url>
+  <url>
+    <loc>https://thewalstreetjournal.github.io/index.html</loc>
+    <lastmod>2026-10-07T18:10:03.417Z</lastmod>
+  </url>
+  <url>
+    <loc>https://thewalstreetjournal.github.io/posts/how-postgres-handles-connections/index.html</loc>
+    <lastmod>2026-10-07T20:35:36.380Z</lastmod>
+  </url>
+  <url>
+    <loc>https://thewalstreetjournal.github.io/posts/inside-the-postgres-wal/index.html</loc>
+    <lastmod>2026-10-08T08:28:23.686Z</lastmod>
   </url>
 </urlset>

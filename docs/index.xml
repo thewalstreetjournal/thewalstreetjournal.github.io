@@ -554,6 +554,1038 @@ font-style: inherit;">();</span></span></code></pre></div></div>
   <media:content url="https://thewalstreetjournal.github.io/posts/clickhouse-keeper-non-blocking-snapshots/snapshot-update-cow.png" medium="image" type="image/png" height="81" width="144"/>
 </item>
 <item>
+  <title>What’s Inside the Postgres Write-Ahead Log</title>
+  <link>https://thewalstreetjournal.github.io/posts/inside-the-postgres-wal/</link>
+  <description><![CDATA[ 
+
+
+
+
+
+
+<p>We all know that Postgres has a write-ahead log ( WAL ) for recovery and replication. We probably also know how to configure it, or how to set up replication with it. But we rarely look at what the WAL is actually made of, or how a record gets written into it.</p>
+<p>So in this post, we’ll do that. We’ll insert a single row, find its WAL record on disk, and then go through the Postgres source to see who wrote that record and how it gets replayed. It’ll be easier to follow if you know how Postgres organizes its storage. I covered that in an <a href="../../posts/how-postgres-stores-data/index.html">earlier post</a>.</p>
+<p>Prefer video? Here’s the same walkthrough:</p>
+<div class="quarto-video ratio ratio-16x9"><iframe data-external="1" src="https://www.youtube.com/embed/YOyq-kvbyU8" title="" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen=""></iframe></div>
+<hr>
+<section id="how-the-wal-is-laid-out" class="level3">
+<h3 class="anchored" data-anchor-id="how-the-wal-is-laid-out">How the WAL is laid out</h3>
+<p>A write-ahead log is an infinite, append-only stream of records. For the tables we normally use, every change is recorded in the WAL: an insert, an update, a change to an index. Each of them produces a WAL record. And once a record is logged, it is immutable.</p>
+<p>But we can’t write an infinite stream to disk as a single file. So Postgres breaks the stream into chunks, and each chunk is a file on disk. These chunks are called <strong>segments</strong>, and each segment is 16MB by default.</p>
+<p>Each segment is again split into <strong>pages</strong> of 8KB each. Every page starts with some headers ( things like the timeline ID and some flags ), followed by the actual WAL records.</p>
+<div class="quarto-figure quarto-figure-center">
+<figure class="figure">
+<p><img src="https://thewalstreetjournal.github.io/posts/inside-the-postgres-wal/wal-segments-pages.png" class="img-fluid figure-img" alt="Top: the WAL as an infinite stream of records such as insert, btree, commit and update. Middle: the same records split into 16MB segment files named 000000010...A1 to A4, the last one still filling. Bottom: one segment file split into 8KB pages, each with headers followed by records."></p>
+<figcaption>wal-stream</figcaption>
+</figure>
+</div>
+<p>Two small details here. The first page of a segment has a few more headers than the rest: the system identifier, the segment size, and the WAL page size. And a WAL record can cross a page boundary. So every page header has a flag that tells Postgres whether the start of this page is a continuation of a record from the previous page.</p>
+<p>Each record also gets a <strong>Log Sequence Number</strong> ( LSN ). It’s a 64-bit number that keeps increasing and is unique for every record. We don’t need to worry about how Postgres generates it. What matters for us is that the LSN tells us where a record lives. If we know the LSN of an INSERT record, we can find that record and read its details. Without the LSN, finding it is possible, but quite hard.</p>
+<p>So let’s find one.</p>
+<hr>
+</section>
+<section id="prerequisites" class="level3">
+<h3 class="anchored" data-anchor-id="prerequisites">Prerequisites</h3>
+<p>I’m using the same postgres 17.6 container as the earlier posts. The Dockerfile is on <a href="https://github.com/thewalstreetjournal/postgres-playlist/tree/main/004-decoding-wal-in-postgres">GitHub</a>.</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1" style="background: #f1f3f5;"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb1-1"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">docker</span> build <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-t</span> postgres-17.6:v1 .</span>
+<span id="cb1-2"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">docker</span> network create pgnet</span>
+<span id="cb1-3"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">docker</span> run <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-d</span> <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">--name</span> postgres <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">--network</span> pgnet <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-e</span> POSTGRES_PASSWORD=secret postgres-17.6:v1</span></code></pre></div></div>
+<p>I keep two terminals open: one running <code>psql</code>, and one with a shell inside the container for looking at the files.</p>
+<hr>
+</section>
+<section id="finding-our-insert-in-the-wal" class="level3">
+<h3 class="anchored" data-anchor-id="finding-our-insert-in-the-wal">Finding our INSERT in the WAL</h3>
+<p>This is a freshly created container, so nothing has happened in it yet. But Postgres has already set up its WAL and has a current LSN. We can get it with <code>pg_current_wal_lsn()</code>:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2" style="background: #f1f3f5;"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb2-1"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">SELECT</span> pg_current_wal_lsn() <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">AS</span> lsn_before_any_activity \gset</span>
+<span id="cb2-2">\echo LSN <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">before</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">any</span> activity: <span class="ch" style="color: #20794D;
+background-color: null;
+font-style: inherit;">:lsn_before_any_activity</span></span></code></pre></div></div>
+<pre><code>LSN before any activity: 0/195A318</code></pre>
+<p><code>\gset</code> stores the result in a psql variable so we can reuse it later. It also hides the output, which is why there’s an <code>\echo</code> after it.</p>
+<p>Now let’s create a table and save the LSN again. Then insert one row and save it once more:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4" style="background: #f1f3f5;"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb4-1"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">CREATE</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">TABLE</span> users (<span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">id</span> <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">integer</span>, name text, email text);</span>
+<span id="cb4-2"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">SELECT</span> pg_current_wal_lsn() <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">AS</span> lsn_after_creating_table \gset</span>
+<span id="cb4-3">\echo LSN <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">after</span> creating <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">table</span>: <span class="ch" style="color: #20794D;
+background-color: null;
+font-style: inherit;">:lsn_after_creating_table</span></span>
+<span id="cb4-4"></span>
+<span id="cb4-5"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">INSERT</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">INTO</span> users <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">VALUES</span> (<span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">1</span>, <span class="st" style="color: #20794D;
+background-color: null;
+font-style: inherit;">'Alice'</span>, <span class="st" style="color: #20794D;
+background-color: null;
+font-style: inherit;">'alice@example.com'</span>);</span>
+<span id="cb4-6"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">SELECT</span> pg_current_wal_lsn() <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">AS</span> lsn_after_inserting_a_tuple \gset</span>
+<span id="cb4-7">\echo LSN <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">after</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">INSERT</span>: <span class="ch" style="color: #20794D;
+background-color: null;
+font-style: inherit;">:lsn_after_inserting_a_tuple</span></span></code></pre></div></div>
+<pre><code>LSN after creating table: 0/19773B0
+LSN after INSERT: 0/1977468</code></pre>
+<p>So we now have three LSNs: one before the <code>CREATE TABLE</code>, one between the <code>CREATE TABLE</code> and the <code>INSERT</code>, and one after the <code>INSERT</code>. The records we’re interested in are somewhere between them.</p>
+<p>Everything Postgres stores lives in its data directory:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6" style="background: #f1f3f5;"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb6-1">SHOW data_directory;</span></code></pre></div></div>
+<pre><code>      data_directory
+--------------------------
+ /var/lib/postgresql/data</code></pre>
+<p>In the other terminal, the WAL is in the <code>pg_wal</code> directory inside it:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb8" style="background: #f1f3f5;"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb8-1"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">docker</span> exec <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-it</span> postgres bash</span>
+<span id="cb8-2"><span class="bu" style="color: null;
+background-color: null;
+font-style: inherit;">cd</span> /var/lib/postgresql/data/pg_wal</span>
+<span id="cb8-3"><span class="fu" style="color: #4758AB;
+background-color: null;
+font-style: inherit;">ls</span></span></code></pre></div></div>
+<pre><code>000000010000000000000001  archive_status  summaries</code></pre>
+<p>There’s only one segment file, since this is a fresh instance. A busy system will have many more. To find out which segment an LSN belongs to, and where inside that file it is, Postgres has <code>pg_walfile_name_offset</code>:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb10" style="background: #f1f3f5;"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb10-1"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">SELECT</span> pg_walfile_name_offset(:<span class="st" style="color: #20794D;
+background-color: null;
+font-style: inherit;">'lsn_before_any_activity'</span>);</span></code></pre></div></div>
+<pre><code>       pg_walfile_name_offset
+------------------------------------
+ (000000010000000000000001,9806616)</code></pre>
+<p>It gives us the segment file’s name and the byte offset inside it. Doing the same for the other two:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb12" style="background: #f1f3f5;"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb12-1"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">SELECT</span> pg_walfile_name_offset(:<span class="st" style="color: #20794D;
+background-color: null;
+font-style: inherit;">'lsn_after_creating_table'</span>);</span>
+<span id="cb12-2"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">SELECT</span> pg_walfile_name_offset(:<span class="st" style="color: #20794D;
+background-color: null;
+font-style: inherit;">'lsn_after_inserting_a_tuple'</span>);</span></code></pre></div></div>
+<pre><code> (000000010000000000000001,9925552)
+ (000000010000000000000001,9925736)</code></pre>
+<p>How does it compute this? The LSN itself carries this information. With 16MB segments, the upper bits of the LSN give the segment number, and the lower 24 bits are the byte offset inside that segment. For example, <code>0/19773B0</code> is segment <code>1</code>, offset <code>0x9773B0</code>, which is <code>9925552</code>.</p>
+<p>The two offsets around the <code>CREATE TABLE</code> are far apart, so that range has a lot of data. The two around our <code>INSERT</code> are only 184 bytes apart. Let’s dump those bytes with <code>xxd</code>:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb14" style="background: #f1f3f5;"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb14-1"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">xxd</span> <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-s</span> 9925552 <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-l</span> <span class="st" style="color: #20794D;
+background-color: null;
+font-style: inherit;">"</span><span class="va" style="color: #111111;
+background-color: null;
+font-style: inherit;">$((</span><span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">9925736</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">9925552</span><span class="va" style="color: #111111;
+background-color: null;
+font-style: inherit;">))</span><span class="st" style="color: #20794D;
+background-color: null;
+font-style: inherit;">"</span> ./000000010000000000000001</span></code></pre></div></div>
+<pre><code>009773b0: 3200 0000 0000 0000 486f 9701 0000 0000  2.......Ho......
+009773c0: 1008 0000 9780 5a82 ff18 0000 0000 0000  ......Z.........
+009773d0: 0000 00b9 3901 f102 0000 f102 0000 f002  ....9...........
+009773e0: 0000 0000 0000 0000 5300 0000 f102 0000  ........S.......
+009773f0: b073 9701 0000 0000 800a 0000 6f26 a7d3  .s..........o&amp;..
+00977400: 0060 2200 7f06 0000 0500 0000 0640 0000  .`"..........@..
+00977410: 0000 0000 ff03 0300 0208 1800 0100 0000  ................
+00977420: 0d41 6c69 6365 2561 6c69 6365 4065 7861  .Alice%alice@exa
+00977430: 6d70 6c65 2e63 6f6d 0100 0000 0000 0000  mple.com........
+00977440: 2200 0000 f102 0000 e873 9701 0000 0000  "........s......
+00977450: 0001 0000 6352 4a9d ff08 2f2b f9c2 59fe  ....cRJ.../+..Y.
+00977460: 0200 0000 0000 0000                      ........</code></pre>
+<p>We can already see <code>Alice</code> and <code>alice@example.com</code> in there. We could try to read the rest byte by byte, like we did for the table pages in the earlier post. But Postgres ships a tool that does it for us, <code>pg_waldump</code>. It takes LSNs, not byte offsets:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb16" style="background: #f1f3f5;"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb16-1"><span class="ex" style="color: null;
+background-color: null;
+font-style: inherit;">pg_waldump</span> <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-s</span> 0/19773B0 <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">-e</span> 0/1977468</span></code></pre></div></div>
+<pre><code>rmgr: Standby     len (rec/tot):     50/    50, tx:          0, lsn: 0/019773B0, prev 0/01976F48, desc: RUNNING_XACTS nextXid 753 latestCompletedXid 752 oldestRunningXid 753
+rmgr: Heap        len (rec/tot):     83/    83, tx:        753, lsn: 0/019773E8, prev 0/019773B0, desc: INSERT+INIT off: 1, flags: 0x00, blkref #0: rel 1663/5/16390 blk 0
+rmgr: Transaction len (rec/tot):     34/    34, tx:        753, lsn: 0/01977440, prev 0/019773E8, desc: COMMIT 2026-09-13 10:43:50.075183 UTC</code></pre>
+<p>One SQL statement produced three WAL records. A more complicated statement could produce many more.</p>
+<ul>
+<li>The first one belongs to the <strong>Standby</strong> resource manager. It describes the transactions running at that moment. We don’t need it here.</li>
+<li>The second one is our insert. It comes from the <strong>Heap</strong> resource manager. <code>INSERT+INIT</code> means Postgres inserted the tuple and also initialized a new heap page in the same record, since this is the first row in the table.</li>
+<li>The third one is the <strong>Transaction</strong> resource manager’s <code>COMMIT</code>, because the insert ran inside a transaction.</li>
+</ul>
+<p>If we did the same for the <code>CREATE TABLE</code>, we’d see many more records, mostly for the system catalogs it updates.</p>
+<div class="callout callout-style-default callout-note callout-titled">
+<div class="callout-header d-flex align-content-center collapsed" data-bs-toggle="collapse" data-bs-target=".callout-1-contents" aria-controls="callout-1" aria-expanded="false" aria-label="Toggle callout">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>The Heap record, byte by byte
+</div>
+<div class="callout-btn-toggle d-inline-block border-0 py-1 ps-1 pe-0 float-end"><i class="callout-toggle"></i></div>
+</div>
+<div id="callout-1" class="callout-1-contents callout-collapse collapse">
+<div class="callout-body-container callout-body">
+<p>The Heap record starts at LSN <code>0/019773E8</code>, offset <code>0x9773E8</code> in the dump. Its 83 bytes are:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 33%">
+<col style="width: 33%">
+<col style="width: 33%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Bytes</th>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>5300 0000</code></td>
+<td><code>xl_tot_len</code></td>
+<td>83 bytes</td>
+</tr>
+<tr class="even">
+<td><code>f102 0000</code></td>
+<td><code>xl_xid</code></td>
+<td>transaction 753</td>
+</tr>
+<tr class="odd">
+<td><code>b073 9701 0000 0000</code></td>
+<td><code>xl_prev</code></td>
+<td><code>0/019773B0</code>, the Standby record before it</td>
+</tr>
+<tr class="even">
+<td><code>80</code></td>
+<td><code>xl_info</code></td>
+<td><code>XLOG_HEAP_INSERT</code> with <code>XLOG_HEAP_INIT_PAGE</code></td>
+</tr>
+<tr class="odd">
+<td><code>0a</code></td>
+<td><code>xl_rmid</code></td>
+<td>10, the Heap resource manager</td>
+</tr>
+<tr class="even">
+<td><code>0000</code></td>
+<td></td>
+<td>padding</td>
+</tr>
+<tr class="odd">
+<td><code>6f26 a7d3</code></td>
+<td><code>xl_crc</code></td>
+<td>checksum</td>
+</tr>
+<tr class="even">
+<td><code>00 60 2200</code></td>
+<td>block header</td>
+<td>block 0, will init the page, has 34 bytes of data</td>
+</tr>
+<tr class="odd">
+<td><code>7f06 0000 0500 0000 0640 0000</code></td>
+<td>relation</td>
+<td>1663 / 5 / 16390</td>
+</tr>
+<tr class="even">
+<td><code>0000 0000</code></td>
+<td>block number</td>
+<td>0</td>
+</tr>
+<tr class="odd">
+<td><code>ff 03</code></td>
+<td>main data header</td>
+<td>3 bytes of main data</td>
+</tr>
+<tr class="even">
+<td><code>0300 0208 18</code></td>
+<td><code>xl_heap_header</code></td>
+<td>3 columns, infomask <code>0x0802</code>, header size 24</td>
+</tr>
+<tr class="odd">
+<td><code>00</code></td>
+<td></td>
+<td>padding up to <code>t_hoff</code></td>
+</tr>
+<tr class="even">
+<td><code>0100 0000</code></td>
+<td><code>id</code></td>
+<td>1</td>
+</tr>
+<tr class="odd">
+<td><code>0d 416c696365</code></td>
+<td><code>name</code></td>
+<td><code>'Alice'</code></td>
+</tr>
+<tr class="even">
+<td><code>25 616c69636540...</code></td>
+<td><code>email</code></td>
+<td><code>'alice@example.com'</code></td>
+</tr>
+<tr class="odd">
+<td><code>0100 00</code></td>
+<td><code>xl_heap_insert</code></td>
+<td>offset 1, flags <code>0x00</code></td>
+</tr>
+</tbody>
+</table>
+<p>These are the same pieces we’ll see being registered in <code>heap_insert</code> below.</p>
+</div>
+</div>
+</div>
+<p>So these are the WAL records for the operations we ran. But what is a “resource manager”, and how do we interpret these records?</p>
+<hr>
+</section>
+<section id="resource-managers" class="level3">
+<h3 class="anchored" data-anchor-id="resource-managers">Resource managers</h3>
+<p>Let’s pretend for a moment that we’re writing the WAL code for Postgres. Different operations need to log different things. An INSERT record needs enough information to rebuild the tuple and the heap page it went into. A CREATE TABLE record, on the other hand, needs to know about the physical file that was created for the table.</p>
+<p>So every record has the same fixed header, with things like the transaction ID and the LSN of the previous record. What comes after the header, let’s call it the payload, is different for every operation.</p>
+<p>How would we design this? We’d keep a registry, say an array. In it, we’d register a “resource manager” for each kind of operation. Each resource manager has a name and implements a set of functions: how to replay its records during recovery, how to describe them, and so on. In Rust we’d do this with trait objects. In Java, with interfaces. In C, with function pointers.</p>
+<p>And that’s what Postgres does. The registry is an array called <code>RmgrTable</code>, and each resource manager in it is a struct called <code>RmgrData</code>.</p>
+<hr>
+</section>
+<section id="in-the-source-code" class="level3">
+<h3 class="anchored" data-anchor-id="in-the-source-code">In the source code</h3>
+<p>All links below are to the <a href="https://github.com/postgres/postgres/tree/REL_17_6">REL_17_6</a> tag.</p>
+<p>The fixed header is the <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/include/access/xlogrecord.h#L41-L53"><code>XLogRecord</code></a> struct in <code>xlogrecord.h</code>. This is the 24-byte header every WAL record starts with:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb18" style="background: #f1f3f5;"><pre class="sourceCode c code-with-copy"><code class="sourceCode c"><span id="cb18-1"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">typedef</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">struct</span> XLogRecord</span>
+<span id="cb18-2"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb18-3">    uint32      xl_tot_len<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span>     <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/* total len of entire record */</span></span>
+<span id="cb18-4">    TransactionId xl_xid<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span>       <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/* xact id */</span></span>
+<span id="cb18-5">    XLogRecPtr  xl_prev<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span>        <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/* ptr to previous record in log */</span></span>
+<span id="cb18-6">    uint8       xl_info<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span>        <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/* flag bits, see below */</span></span>
+<span id="cb18-7">    RmgrId      xl_rmid<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span>        <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/* resource manager for this record */</span></span>
+<span id="cb18-8">    <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/* 2 bytes of padding here, initialize to zero */</span></span>
+<span id="cb18-9">    pg_crc32c   xl_crc<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span>         <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/* CRC for this record */</span></span>
+<span id="cb18-10"></span>
+<span id="cb18-11">    <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/* XLogRecordBlockHeaders and XLogRecordDataHeader follow, no padding */</span></span>
+<span id="cb18-12"></span>
+<span id="cb18-13"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span> XLogRecord<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span></code></pre></div></div>
+<p>The comment <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/include/access/xlogrecord.h#L21-L30">above it</a> describes the full layout of a record: the fixed header, then a header for each block ( page ) the record touches, then the data for those blocks, and finally the “main data” that belongs to the resource manager.</p>
+<p>The registry, <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/access/transam/rmgr.c#L47-L52"><code>RmgrTable</code></a>, is in <code>rmgr.c</code>:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb19" style="background: #f1f3f5;"><pre class="sourceCode c code-with-copy"><code class="sourceCode c"><span id="cb19-1"><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">#define PG_RMGR</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">symname</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">name</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">redo</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">desc</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">identify</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">startup</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">cleanup</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">mask</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">decode</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;"> </span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">\</span></span>
+<span id="cb19-2"><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">    </span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;"> name</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;"> redo</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;"> desc</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;"> identify</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;"> startup</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;"> cleanup</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;"> mask</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;"> decode </span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">},</span></span>
+<span id="cb19-3"></span>
+<span id="cb19-4">RmgrData    RmgrTable<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">[</span>RM_MAX_ID <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">+</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">1</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">]</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb19-5"><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">#include </span><span class="im" style="color: #00769E;
+background-color: null;
+font-style: inherit;">"access/rmgrlist.h"</span></span>
+<span id="cb19-6"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">};</span></span></code></pre></div></div>
+<p>Its entries come from <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/include/access/rmgrlist.h#L27-L49"><code>rmgrlist.h</code></a>. That’s where all the resource managers are listed, including the Heap, Standby and Transaction ones we saw in <code>pg_waldump</code>. The <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/include/access/rmgrlist.h#L38">Heap entry</a> looks like this:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb20" style="background: #f1f3f5;"><pre class="sourceCode c code-with-copy"><code class="sourceCode c"><span id="cb20-1">PG_RMGR<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>RM_HEAP_ID<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> <span class="st" style="color: #20794D;
+background-color: null;
+font-style: inherit;">"Heap"</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> heap_redo<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> heap_desc<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> heap_identify<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> NULL<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> NULL<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> heap_mask<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> heap_decode<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span></span></code></pre></div></div>
+<p>Each entry fills in an <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/include/access/xlog_internal.h#L349-L360"><code>RmgrData</code></a>, which is mostly function pointers:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb21" style="background: #f1f3f5;"><pre class="sourceCode c code-with-copy"><code class="sourceCode c"><span id="cb21-1"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">typedef</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">struct</span> RmgrData</span>
+<span id="cb21-2"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb21-3">    <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">const</span> <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">char</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">*</span>rm_name<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb21-4">    <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">void</span>        <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(*</span>rm_redo<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>XLogReaderState <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">*</span>record<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb21-5">    <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">void</span>        <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(*</span>rm_desc<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>StringInfo buf<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> XLogReaderState <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">*</span>record<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb21-6">    <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">const</span> <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">char</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">*(*</span>rm_identify<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>uint8 info<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb21-7">    <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">void</span>        <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(*</span>rm_startup<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span><span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">void</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb21-8">    <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">void</span>        <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(*</span>rm_cleanup<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span><span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">void</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb21-9">    <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">void</span>        <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(*</span>rm_mask<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span><span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">char</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">*</span>pagedata<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> BlockNumber blkno<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb21-10">    <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">void</span>        <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(*</span>rm_decode<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">struct</span> LogicalDecodingContext <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">*</span>ctx<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span></span>
+<span id="cb21-11">                              <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">struct</span> XLogRecordBuffer <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">*</span>buf<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb21-12"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span> RmgrData<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span></code></pre></div></div>
+<p>Every resource manager implements its own versions of these functions, and the WAL machinery calls them through these pointers. That’s roughly the design we had in mind.</p>
+<section id="writing-the-record-heap_insert" class="level4">
+<h4 class="anchored" data-anchor-id="writing-the-record-heap_insert">Writing the record: <code>heap_insert</code></h4>
+<p>Now let’s follow our INSERT. Every row inserted into a regular table goes through <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/access/heap/heapam.c#L2038"><code>heap_insert</code></a> in <code>heapam.c</code>. While reading it, keep in mind that all of this is for recovery. Whatever gets logged here is what the redo function will use to recreate the change.</p>
+<p>Before any WAL is written, <code>heap_insert</code> does a few other things. It prepares the tuple ( fills in the header fields, and TOASTs it if a value is too long ), finds a page with enough room for it, and handles some conflict checks and the visibility map.</p>
+<p>Then the <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/access/heap/heapam.c#L2116">WAL part</a> starts. First, there’s a <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/access/heap/heapam.c#L2132-L2142">small check</a>:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb22" style="background: #f1f3f5;"><pre class="sourceCode c code-with-copy"><code class="sourceCode c"><span id="cb22-1"><span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">if</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>ItemPointerGetOffsetNumber<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(&amp;(</span>heaptup<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-&gt;</span>t_self<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">))</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">==</span> FirstOffsetNumber <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&amp;&amp;</span></span>
+<span id="cb22-2">    PageGetMaxOffsetNumber<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>page<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">==</span> FirstOffsetNumber<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span></span>
+<span id="cb22-3"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb22-4">    info <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">|=</span> XLOG_HEAP_INIT_PAGE<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb22-5">    bufflags <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">|=</span> REGBUF_WILL_INIT<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb22-6"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span></span></code></pre></div></div>
+<p>If this tuple is the first and only one on the page, the record gets the <code>INIT</code> flag. That’s the <code>+INIT</code> we saw in <code>pg_waldump</code>. During recovery, it tells Postgres that this is a fresh page, so it can just create a new page and put the tuple in it. Otherwise, Postgres would have to read the existing page first and then insert into it.</p>
+<p>After that, logging the record takes four steps ( <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/access/heap/heapam.c#L2167-L2189">L2167–L2189</a> ):</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb23" style="background: #f1f3f5;"><pre class="sourceCode c code-with-copy"><code class="sourceCode c"><span id="cb23-1">XLogBeginInsert<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">();</span></span>
+<span id="cb23-2">XLogRegisterData<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">((</span><span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">char</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">*)</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&amp;</span>xlrec<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> SizeOfHeapInsert<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb23-3"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">...</span></span>
+<span id="cb23-4">XLogRegisterBuffer<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span><span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">0</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> buffer<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> REGBUF_STANDARD <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">|</span> bufflags<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb23-5">XLogRegisterBufData<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span><span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">0</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span><span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">char</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">*)</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&amp;</span>xlhdr<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> SizeOfHeapHeader<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb23-6">XLogRegisterBufData<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span><span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">0</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span></span>
+<span id="cb23-7">                    <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span><span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">char</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">*)</span> heaptup<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-&gt;</span>t_data <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">+</span> SizeofHeapTupleHeader<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span></span>
+<span id="cb23-8">                    heaptup<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-&gt;</span>t_len <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-</span> SizeofHeapTupleHeader<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb23-9"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">...</span></span>
+<span id="cb23-10">recptr <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> XLogInsert<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>RM_HEAP_ID<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> info<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span></code></pre></div></div>
+<ol type="1">
+<li><strong><code>XLogBeginInsert()</code></strong> checks whether we’re allowed to write WAL at all. For example, a replica that is replaying WAL can’t write WAL records of its own.</li>
+<li><strong><code>XLogRegisterData()</code></strong> registers the “main” data of the record. For the Heap insert, that’s a tiny struct, <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/include/access/heapam_xlog.h#L159-L165"><code>xl_heap_insert</code></a>: the offset of the slot on the page the tuple went into, and some flags. These are the <code>off: 1, flags: 0x00</code> in the <code>pg_waldump</code> output.</li>
+<li><strong><code>XLogRegisterBuffer()</code></strong> registers the in-memory page we modified. From it, Postgres works out the tablespace, database, relation file and block number. That’s the <code>rel 1663/5/16390 blk 0</code> in <code>pg_waldump</code>. During replay, this tells Postgres which page on disk to change.</li>
+<li><strong><code>XLogRegisterBufData()</code></strong>, called twice, attaches data to that page. The first call registers the tuple’s header, and the second registers the tuple data itself. This is where our row ends up in the WAL.</li>
+</ol>
+<p>Finally, <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/access/transam/xloginsert.c#L474"><code>XLogInsert</code></a> assembles everything that was registered into one record, in the right order. It computes the checksum, stamps the resource manager’s ID on the record, and copies it into the WAL buffers, from where it’s written to <code>pg_wal</code>. It returns the record’s LSN.</p>
+</section>
+<section id="replaying-the-record-heap_redo" class="level4">
+<h4 class="anchored" data-anchor-id="replaying-the-record-heap_redo">Replaying the record: <code>heap_redo</code></h4>
+<p>All of this was so the change can be replayed during recovery. For the Heap resource manager, that’s <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/access/heap/heapam.c#L10338"><code>heap_redo</code></a>. It’s a simple switch on the record type:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb24" style="background: #f1f3f5;"><pre class="sourceCode c code-with-copy"><code class="sourceCode c"><span id="cb24-1"><span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">switch</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>info <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&amp;</span> XLOG_HEAP_OPMASK<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span></span>
+<span id="cb24-2"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb24-3">    <span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">case</span> XLOG_HEAP_INSERT<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">:</span></span>
+<span id="cb24-4">        heap_xlog_insert<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>record<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb24-5">        <span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">break</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb24-6">    <span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">case</span> XLOG_HEAP_DELETE<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">:</span></span>
+<span id="cb24-7">        heap_xlog_delete<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>record<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb24-8">        <span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">break</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb24-9">    <span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">case</span> XLOG_HEAP_UPDATE<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">:</span></span>
+<span id="cb24-10">        heap_xlog_update<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>record<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">false</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb24-11">        <span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">break</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb24-12">    <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">...</span></span>
+<span id="cb24-13"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span></span></code></pre></div></div>
+<p><a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/access/heap/heapam.c#L9592"><code>heap_xlog_insert</code></a> does the reverse of what we saw in <code>heap_insert</code>. It takes the WAL record and redoes the insert on the same page, in the same slot. And here’s the <code>INIT</code> flag being used ( <a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/access/heap/heapam.c#L9638-L9646">L9638–L9646</a> ):</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb25" style="background: #f1f3f5;"><pre class="sourceCode c code-with-copy"><code class="sourceCode c"><span id="cb25-1"><span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">if</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>XLogRecGetInfo<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>record<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&amp;</span> XLOG_HEAP_INIT_PAGE<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span></span>
+<span id="cb25-2"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb25-3">    buffer <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> XLogInitBufferForRedo<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>record<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">0</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb25-4">    page <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> BufferGetPage<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>buffer<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb25-5">    PageInit<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>page<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> BufferGetPageSize<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>buffer<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">),</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">0</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb25-6">    action <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> BLK_NEEDS_REDO<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb25-7"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span></span>
+<span id="cb25-8"><span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">else</span></span>
+<span id="cb25-9">    action <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> XLogReadBufferForRedo<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>record<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">0</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&amp;</span>buffer<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span></code></pre></div></div>
+<p>So for one INSERT, the Heap resource manager handles everything: <code>heap_insert</code> writes the record, and <code>heap_redo</code> replays it during recovery.</p>
+<hr>
+</section>
+</section>
+<section id="summary" class="level3">
+<h3 class="anchored" data-anchor-id="summary">Summary</h3>
+<ul>
+<li>The WAL is an infinite stream of records, split into 16MB segment files, which are further split into 8KB pages.</li>
+<li>Every record can be located by its LSN. Each record has a fixed header, followed by a payload specific to that operation.</li>
+<li>Resource managers define what goes in the payload, how to replay it, and how to decode it. They are registered in <code>RmgrTable</code>.</li>
+<li>Tools like <code>pg_waldump</code> let us read the WAL in a human-readable form.</li>
+</ul>
+<hr>
+</section>
+<section id="what-i-left-out" class="level3">
+<h3 class="anchored" data-anchor-id="what-i-left-out">What I left out</h3>
+<ul>
+<li><strong>Full-page images.</strong> After every checkpoint, the first change to a page writes the entire 8KB page into the WAL, to protect against torn pages.</li>
+<li><strong>Redo is safe to repeat.</strong> Replaying a record on a page that already has the change does nothing. The page’s LSN tells Postgres whether the change is already there.</li>
+<li><strong><code>wal_level</code> changes what gets logged.</strong> Under <code>wal_level = logical</code>, the INSERT record gets an extra flag ( <code>0x08</code> ) and always keeps the tuple data, so logical decoding can read it.</li>
+<li><strong>Indexes write their own records.</strong> An insert into a table with an index also produces records from the index’s resource manager ( for example, Btree ), separate from the Heap record.</li>
+</ul>
+<hr>
+</section>
+<section id="credits-and-resources" class="level3">
+<h3 class="anchored" data-anchor-id="credits-and-resources">Credits and Resources</h3>
+<ol type="1">
+<li><a href="https://www.postgresql.org/docs/17/wal-internals.html">WAL Internals</a>, PostgreSQL docs</li>
+<li><a href="https://www.postgresql.org/docs/17/pgwaldump.html">pg_waldump</a>, PostgreSQL docs</li>
+<li><a href="https://github.com/postgres/postgres/blob/REL_17_6/src/backend/access/transam/README">The transam README</a> in the postgres source</li>
+<li><a href="https://github.com/postgres/postgres/tree/REL_17_6">Postgres Source Code</a></li>
+</ol>
+<hr>
+
+
+</section>
+
+ ]]></description>
+  <category>postgres</category>
+  <category>internals</category>
+  <guid>https://thewalstreetjournal.github.io/posts/inside-the-postgres-wal/</guid>
+  <pubDate>Thu, 01 Oct 2026 18:30:00 GMT</pubDate>
+  <media:content url="https://thewalstreetjournal.github.io/posts/inside-the-postgres-wal/wal-segments-pages.png" medium="image" type="image/png" height="141" width="144"/>
+</item>
+<item>
   <title>How the Postgres Free Space Map Works</title>
   <link>https://thewalstreetjournal.github.io/posts/postgres-free-space-map/</link>
   <description><![CDATA[ 
