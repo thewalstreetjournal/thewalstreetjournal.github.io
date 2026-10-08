@@ -1,0 +1,1007 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.8.26">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+<meta name="dcterms.date" content="2026-10-07">
+<meta name="description" content="ClickHouse Keeper snapshots its in-memory state without blocking writes, using a hash map and a doubly linked list. The design, traced through the source.">
+
+<title>How ClickHouse Keeper Takes Non-Blocking Snapshots – The WAL Street Journal</title>
+<style>
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: min(4vw, 1.5em);}
+div.column{flex: auto; overflow-x: auto;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="../../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../../">
+<link href="../../favicon.png" rel="icon" type="image/png">
+<script src="../../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../../site_libs/quarto-html/axe/axe-check.js" type="module"></script>
+<script src="../../site_libs/quarto-html/popper.min.js"></script>
+<script src="../../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../../site_libs/quarto-html/quarto-syntax-highlighting-587c61ba64f3a5504c4d52d930310e48.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../../site_libs/quarto-html/quarto-syntax-highlighting-dark-b758ccaa5987ceb1b75504551e579abf.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../../site_libs/quarto-html/quarto-syntax-highlighting-587c61ba64f3a5504c4d52d930310e48.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../../site_libs/bootstrap/bootstrap-4b2f21892da54ec5b138bd6f8a390d32.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../../site_libs/bootstrap/bootstrap-dark-743ce29ad2e07205429a880e211ee2ec.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../../site_libs/bootstrap/bootstrap-4b2f21892da54ec5b138bd6f8a390d32.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+<script async="" src="https://www.googletagmanager.com/gtag/js?id=G-NMYW1XQTP9"></script>
+
+<script type="text/javascript">
+
+window.dataLayer = window.dataLayer || [];
+function gtag(){dataLayer.push(arguments);}
+gtag('js', new Date());
+gtag('config', 'G-NMYW1XQTP9', { 'anonymize_ip': true});
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
+<link href="https://fonts.googleapis.com/css2?family=Sofia&amp;family=Playfair+Display:wght@700&amp;display=swap" rel="stylesheet">
+
+
+<link rel="stylesheet" href="../../styles.css">
+<meta property="og:title" content="How ClickHouse Keeper Takes Non-Blocking Snapshots – The WAL Street Journal">
+<meta property="og:description" content="ClickHouse Keeper snapshots its in-memory state without blocking writes, using a hash map and a doubly linked list. The design, traced through the source.">
+<meta property="og:image" content="https://thewalstreetjournal.github.io/posts/clickhouse-keeper-non-blocking-snapshots/snapshot-update-cow.png">
+<meta property="og:site_name" content="The WAL Street Journal">
+<meta property="og:image:height" content="1080">
+<meta property="og:image:width" content="1920">
+<meta name="twitter:title" content="How ClickHouse Keeper Takes Non-Blocking Snapshots – The WAL Street Journal">
+<meta name="twitter:description" content="ClickHouse Keeper snapshots its in-memory state without blocking writes, using a hash map and a doubly linked list. The design, traced through the source.">
+<meta name="twitter:image" content="https://thewalstreetjournal.github.io/posts/clickhouse-keeper-non-blocking-snapshots/snapshot-update-cow.png">
+<meta name="twitter:image-height" content="1080">
+<meta name="twitter:image-width" content="1920">
+<meta name="twitter:card" content="summary_large_image">
+</head>
+
+<body class="nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top quarto-banner">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a class="navbar-brand" href="../../index.html">
+    <span class="navbar-title">The WAL Street Journal</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link" href="../../index.html"> 
+<span class="menu-text">Blog</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="../../about.html"> 
+<span class="menu-text">About</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/thewalstreetjournal"> <i class="bi bi-github" role="img">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://www.youtube.com/@TheWALStreetJournal"> <i class="bi bi-youtube" role="img">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+  <li class="nav-item compact">
+    <a class="nav-link" href="../../index.xml"> <i class="bi bi-rss" role="img">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+</header>
+<!-- content -->
+<header id="title-block-header" class="quarto-title-block default page-columns page-full">
+  <div class="quarto-title-banner page-columns page-full">
+    <div class="quarto-title column-body">
+      <h1 class="title">How ClickHouse Keeper Takes Non-Blocking Snapshots</h1>
+                  <div>
+        <div class="description">
+          ClickHouse Keeper snapshots its in-memory state without blocking writes, using a hash map and a doubly linked list. The design, traced through the source.
+        </div>
+      </div>
+                          <div class="quarto-categories">
+                <div class="quarto-category">clickhouse</div>
+                <div class="quarto-category">internals</div>
+              </div>
+                  </div>
+  </div>
+    
+  
+  <div class="quarto-title-meta">
+
+      
+      <div>
+      <div class="quarto-title-meta-heading">Published</div>
+      <div class="quarto-title-meta-contents">
+        <p class="date">October 7, 2026</p>
+      </div>
+    </div>
+    
+      
+    </div>
+    
+  
+  </header><div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#why-the-simple-approaches-dont-work" id="toc-why-the-simple-approaches-dont-work" class="nav-link active" data-scroll-target="#why-the-simple-approaches-dont-work">Why the simple approaches don’t work</a></li>
+  <li><a href="#why-not-a-plain-hash-map" id="toc-why-not-a-plain-hash-map" class="nav-link" data-scroll-target="#why-not-a-plain-hash-map">Why not a plain hash map?</a></li>
+  <li><a href="#a-hash-map-and-a-doubly-linked-list" id="toc-a-hash-map-and-a-doubly-linked-list" class="nav-link" data-scroll-target="#a-hash-map-and-a-doubly-linked-list">A hash map and a doubly linked list</a></li>
+  <li><a href="#in-the-source-code" id="toc-in-the-source-code" class="nav-link" data-scroll-target="#in-the-source-code">In the source code</a></li>
+  <li><a href="#summary" id="toc-summary" class="nav-link" data-scroll-target="#summary">Summary</a></li>
+  <li><a href="#credits-and-resources" id="toc-credits-and-resources" class="nav-link" data-scroll-target="#credits-and-resources">Credits and Resources</a></li>
+  </ul>
+</nav>
+    </div>
+<!-- main -->
+<main class="content quarto-banner-title-block" id="quarto-document-content">
+
+
+
+
+
+
+<p>Let’s say we have an in-memory database, and it’s serving thousands of writes per second. How do we save a consistent snapshot of it to disk, without locking the whole database while we do it?</p>
+<p>Redis famously solves this at the OS level, using the <code>fork()</code> system call and copy-on-write virtual memory pages. ClickHouse Keeper does it completely in user space. It takes non-blocking snapshots using two simple data structures: a doubly linked list and a hash map. In this post, we’ll look at how that works, and then find it in the ClickHouse source code.</p>
+<p>Prefer video? Here’s the same walkthrough:</p>
+<div class="quarto-video ratio ratio-16x9"><iframe data-external="1" src="https://www.youtube.com/embed/7J93WKEFinA" title="" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen=""></iframe></div>
+<hr>
+<section id="why-the-simple-approaches-dont-work" class="level3">
+<h3 class="anchored" data-anchor-id="why-the-simple-approaches-dont-work">Why the simple approaches don’t work</h3>
+<p>There are two brute-force ways to take a snapshot, and neither really works for us:</p>
+<ol type="1">
+<li><strong>Hold a global lock while writing to disk.</strong> Every client write waits until the snapshot is done, which could take seconds.</li>
+<li><strong>Deep-copy the whole map in memory</strong>, and let a background thread write the copy to disk. Now we’re using double the memory. And usually only a small fraction of the keys change while the snapshot is being written, so most of that copying is wasted.</li>
+</ol>
+<p>So what ClickHouse Keeper needs is a data structure with three properties:</p>
+<ol type="1">
+<li>Constant-time lookups, for the clients reading the data.</li>
+<li>No locking, or if that’s not possible, locking only for a very short time.</li>
+<li>Copy-on-write only for the keys that change. That way, the extra memory we use is proportional to the number of writes during the snapshot.</li>
+</ol>
+<hr>
+</section>
+<section id="why-not-a-plain-hash-map" class="level3">
+<h3 class="anchored" data-anchor-id="why-not-a-plain-hash-map">Why not a plain hash map?</h3>
+<p>The obvious question is: why can’t we do this with a regular hash map, like <code>std::unordered_map</code> in C++?</p>
+<p>The problem is that as writes keep arriving during a snapshot, the hash map will eventually need to grow and <strong>rehash</strong>. Rehashing moves keys into different buckets, so the order of the keys gets scrambled. If the snapshot thread is walking through the buckets while that happens, it can miss some keys and write others twice.</p>
+<p>We need a structure that gives us constant-time lookups, but also a stable, predictable order to walk through.</p>
+<hr>
+</section>
+<section id="a-hash-map-and-a-doubly-linked-list" class="level3">
+<h3 class="anchored" data-anchor-id="a-hash-map-and-a-doubly-linked-list">A hash map and a doubly linked list</h3>
+<p>To get both, we can combine two data structures we already know:</p>
+<ol type="1">
+<li>A <strong>hash map</strong> for constant-time lookups.</li>
+<li>A <strong>doubly linked list</strong> that keeps a stable insertion order.</li>
+</ol>
+<p>The key-value data actually lives in the nodes of the linked list. The hash map stores the keys, and each key’s value is a pointer to that key’s node in the list.</p>
+<p><img src="hashmap-and-list.png" class="img-fluid" alt="A hash map with keys alice, bob and carol, each pointing to a node in a doubly linked list holding 30, 25 and 35."></p>
+<p>Let’s look at how this behaves in two cases: during normal operation, when no snapshot is running, and while a snapshot is being taken.</p>
+<section id="normal-operation" class="level4">
+<h4 class="anchored" data-anchor-id="normal-operation">Normal operation</h4>
+<p>When there’s no snapshot running, everything is straightforward, and every operation is O(1):</p>
+<ul>
+<li><strong>Insert <code>dave</code>:</strong> look up <code>dave</code> in the hash map. It isn’t there, so append a new node at the tail of the list, and store a pointer to it in the hash map.</li>
+<li><strong>Update <code>dave</code> to 45:</strong> look up <code>dave</code>, follow the pointer to its node, and change the value in place.</li>
+<li><strong>Delete <code>bob</code>:</strong> look up <code>bob</code>, unlink its node from the list, and remove the key from the hash map.</li>
+</ul>
+</section>
+<section id="during-a-snapshot" class="level4">
+<h4 class="anchored" data-anchor-id="during-a-snapshot">During a snapshot</h4>
+<p>Here’s the idea. The snapshot thread starts at the head of the list and walks it node by node, writing each node to disk, without holding any lock. At the moment the snapshot starts, the list has some fixed number of nodes. Let’s call it <strong>N</strong>. We can think of this as a <strong>cut-off line</strong>.</p>
+<p>If we can guarantee that every write that arrives after the snapshot starts only ever touches the list <em>after</em> this cut-off line, the snapshot thread can safely walk the first N nodes while writes carry on.</p>
+<p>To start a snapshot, we record N and turn on a “snapshot mode” flag. Both must happen together, so we take a lock for that tiny moment, record the two values, and release it. Reads and writes are blocked only for those few instructions.</p>
+<p><img src="snapshot-cutoff.png" class="img-fluid" alt="Snapshot mode is on. A cut-off line is drawn after the third node, N = 3. New writes go after the line."></p>
+<p>Now the operations behave like this:</p>
+<ul>
+<li><strong>Insert:</strong> nothing changes. New nodes are always appended at the tail, which is after the cut-off line anyway.</li>
+<li><strong>Update:</strong> if the node is <em>before</em> the cut-off line, we can’t change it, because the snapshot thread may not have written it yet. So we mark the old node as <strong>inactive</strong>, append a copy with the new value at the tail, and point the hash map at the copy. That’s the copy-on-write, and readers see the new value straight away. If the same key is updated again, its node is now after the cut-off line, so it’s simply changed in place.</li>
+</ul>
+<p><img src="snapshot-update-cow.png" class="img-fluid" alt="update('bob', 27) during a snapshot: bob's old node 25 is marked inactive and stays before the cut-off line, and bob now points to a new node 27 after the line."></p>
+<ul>
+<li><strong>Delete:</strong> we remove the key from the hash map, but we leave its node in the list, marked as inactive. If it’s before the cut-off line, the snapshot thread still has to write it.</li>
+</ul>
+<p><img src="snapshot-delete.png" class="img-fluid" alt="delete('carol') during a snapshot: carol is removed from the hash map, but her node 35 stays in the list marked inactive."></p>
+<p>When the snapshot has written all N nodes, there’s a quick cleanup. We take a brief lock, go through only the nodes marked inactive, remove them from the list, and turn snapshot mode off.</p>
+<p><img src="after-snapshot.png" class="img-fluid" alt="After the snapshot: the inactive nodes are removed, leaving 30, 40 and 27 in the list."></p>
+<p>That’s the whole design. Writes after the cut-off line are invisible to the snapshot, and only the keys that change get copied. Lookups stay O(1), the lock is held only for a moment at the start and the end, and the extra memory is proportional to the writes during the snapshot. It hits every item on the wishlist.</p>
+<p>I find it pretty cool how two simple data structures, put together, solve what looks like a hard problem.</p>
+<hr>
+</section>
+</section>
+<section id="in-the-source-code" class="level3">
+<h3 class="anchored" data-anchor-id="in-the-source-code">In the source code</h3>
+<p><a href="https://github.com/ClickHouse/ClickHouse">ClickHouse</a> is an open-source OLAP database. It has its own implementation of ZooKeeper, called ClickHouse Keeper, and that’s what we’ve been looking at. The code below is from the <a href="https://github.com/ClickHouse/ClickHouse/tree/v26.2.1.1139-stable/src/Coordination">v26.2.1.1139-stable</a> release.</p>
+<section id="the-two-structures" class="level4">
+<h4 class="anchored" data-anchor-id="the-two-structures">The two structures</h4>
+<p>Everything lives in <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/SnapshotableHashTable.h#L86-L95"><code>SnapshotableHashTable.h</code></a>:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> List <span class="op">=</span> <span class="bu">std::</span>list<span class="op">&lt;</span>ListElem<span class="op">&gt;;</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> Mapped <span class="op">=</span> <span class="kw">typename</span> List<span class="op">::</span>iterator<span class="op">;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> IndexMap <span class="op">=</span> HashMap<span class="op">&lt;</span><span class="bu">std::</span>string_view<span class="op">,</span> Mapped<span class="op">&gt;;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>List list<span class="op">;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>IndexMap map<span class="op">;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="dt">bool</span> snapshot_mode<span class="op">{</span><span class="kw">false</span><span class="op">};</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="co">/// Allows to avoid additional copies in updateValue function</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="dt">size_t</span> current_version<span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="dt">size_t</span> snapshot_up_to_version<span class="op">{</span><span class="dv">0</span><span class="op">};</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>There are the two structures: a <code>std::list</code>, which is a doubly linked list, and a hash map whose values are iterators into that list. Then there’s the snapshot mode flag, and two version numbers.</p>
+<p>Each node in the list is a <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/SnapshotableHashTable.h#L15-L25"><code>ListNode</code></a>. It holds the key, the value, and some metadata packed into a single 64-bit field:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> active_in_map <span class="op">:</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> free_key <span class="op">:</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> version <span class="op">:</span> <span class="dv">62</span><span class="op">;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> node_metadata<span class="op">{</span><span class="kw">false</span><span class="op">,</span> <span class="kw">false</span><span class="op">,</span> <span class="dv">0</span><span class="op">};</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p><code>active_in_map</code> is the active/inactive flag from earlier. <code>version</code> is how ClickHouse knows which side of the cut-off line a node is on. Every node records the table’s <code>current_version</code> at the time it was written. When a snapshot starts, the current version becomes <code>snapshot_up_to_version</code>, and <code>current_version</code> is bumped by one ( <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/SnapshotableHashTable.h#L388-L393"><code>enableSnapshotMode</code></a> ). So any node with <code>version &lt;= snapshot_up_to_version</code> is before the cut-off line, and anything written after the snapshot started is after it.</p>
+</section>
+<section id="starting-a-snapshot-the-short-lock" class="level4">
+<h4 class="anchored" data-anchor-id="starting-a-snapshot-the-short-lock">Starting a snapshot: the short lock</h4>
+<p>The snapshot starts in <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/KeeperStateMachine.cpp#L823-L826"><code>KeeperStateMachine.cpp</code></a>, the Raft state machine. The comment says exactly what we described:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="op">{</span> <span class="co">/// lock storage for a short period time to turn on "snapshot mode". After that we can read consistent storage state without locking.</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    LockGuardWithStats<span class="op">&lt;</span><span class="kw">false</span><span class="op">&gt;</span> lock<span class="op">(</span>storage_mutex<span class="op">);</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    snapshot_task<span class="op">.</span>snapshot <span class="op">=</span> <span class="bu">std::</span>make_shared<span class="op">&lt;</span>KeeperStorageSnapshot<span class="op">&lt;</span>Storage<span class="op">&gt;&gt;(</span>storage<span class="op">.</span>get<span class="op">(),</span> snapshot_meta_copy<span class="op">,</span> getClusterConfig<span class="op">());</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>The lock is scoped, so it’s released as soon as the block ends. Inside, the snapshot object is created. Its constructor, in <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/KeeperSnapshotManager.cpp#L615-L618"><code>KeeperSnapshotManager.cpp</code></a>, records N and turns on snapshot mode:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">auto</span> <span class="op">[</span>size<span class="op">,</span> ver<span class="op">]</span> <span class="op">=</span> storage<span class="op">-&gt;</span>container<span class="op">.</span>snapshotSizeWithVersion<span class="op">();</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>snapshot_container_size <span class="op">=</span> size<span class="op">;</span>          <span class="co">// this is N</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>storage<span class="op">-&gt;</span>enableSnapshotMode<span class="op">(</span>ver<span class="op">);</span>        <span class="co">// the flag, and the cut-off version</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>begin <span class="op">=</span> storage<span class="op">-&gt;</span>getSnapshotIteratorBegin<span class="op">();</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</section>
+<section id="writes-during-the-snapshot" class="level4">
+<h4 class="anchored" data-anchor-id="writes-during-the-snapshot">Writes during the snapshot</h4>
+<p>Back in <code>SnapshotableHashTable.h</code>, <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/SnapshotableHashTable.h#L210"><code>insert</code></a> doesn’t care about snapshot mode at all. It just appends to the list and adds the key to the map.</p>
+<p><a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/SnapshotableHashTable.h#L297-L343"><code>updateValue</code></a> is where the copy-on-write happens:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>snapshot_mode<span class="op">)</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// We in snapshot mode but updating some node which is already more</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// fresh than snapshot distance. So it will not participate in</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// snapshot and we don't need to copy it.</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>list_itr<span class="op">-&gt;</span>getVersion<span class="op">()</span> <span class="op">&lt;=</span> snapshot_up_to_version<span class="op">)</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>        <span class="kw">auto</span> elem_copy <span class="op">=</span> list_itr<span class="op">-&gt;</span>copyFromSnapshotNode<span class="op">();</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>        <span class="op">...</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>        list_itr<span class="op">-&gt;</span>setInactiveInMap<span class="op">();</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>        snapshot_invalid_iters<span class="op">.</span>push_back<span class="op">(</span>list_itr<span class="op">);</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>        updater<span class="op">(</span>elem_copy<span class="op">.</span>value<span class="op">);</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>        elem_copy<span class="op">.</span>setVersion<span class="op">(</span>current_version<span class="op">);</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>        <span class="kw">auto</span> itr <span class="op">=</span> list<span class="op">.</span>insert<span class="op">(</span>list<span class="op">.</span>end<span class="op">(),</span> <span class="bu">std::</span>move<span class="op">(</span>elem_copy<span class="op">));</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>        it<span class="op">-&gt;</span>getMapped<span class="op">()</span> <span class="op">=</span> itr<span class="op">;</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>        <span class="op">...</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">else</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>        updater<span class="op">(</span>list_itr<span class="op">-&gt;</span>value<span class="op">);</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>        <span class="op">...</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>If the node is before the cut-off line, it’s marked inactive, a copy with the new value is appended at the end, and the map is pointed at the copy. Otherwise, it’s updated in place.</p>
+<p><a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/SnapshotableHashTable.h#L266-L290"><code>erase</code></a> follows the same pattern. In snapshot mode, it marks the node inactive and removes the key from the map, but it does not remove the node from the list. Outside snapshot mode, it removes both.</p>
+<p>Notice <code>snapshot_invalid_iters</code>. Every node that becomes inactive is added to this list, so that the cleanup doesn’t have to walk the whole linked list to find them.</p>
+</section>
+<section id="writing-the-snapshot-and-cleaning-up" class="level4">
+<h4 class="anchored" data-anchor-id="writing-the-snapshot-and-cleaning-up">Writing the snapshot and cleaning up</h4>
+<p>The snapshot itself is written by a background task, created right after the short lock in <code>KeeperStateMachine.cpp</code>. Depending on where the snapshot is going, it calls <code>serializeSnapshotToDisk</code> or <code>serializeSnapshotBufferToDisk</code>. Both end up in <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/KeeperSnapshotManager.cpp#L260-L264"><code>serialize</code></a>, which walks exactly N nodes from the start of the list:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(</span><span class="kw">auto</span> it <span class="op">=</span> snapshot<span class="op">.</span>begin<span class="op">;</span> counter <span class="op">&lt;</span> snapshot<span class="op">.</span>snapshot_container_size<span class="op">;</span> <span class="op">++</span>counter<span class="op">)</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>When it’s done, the cleanup takes the storage lock again, very briefly ( <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/KeeperStateMachine.cpp#L888-L894">L888–L894</a> ):</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb7"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">/// Destroy snapshot with lock</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>LockGuardWithStats<span class="op">&lt;</span><span class="kw">false</span><span class="op">&gt;</span> lock<span class="op">(</span>storage_mutex<span class="op">);</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="op">...</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="co">/// Turn off "snapshot mode" and clear outdate part of storage state</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>storage<span class="op">-&gt;</span>clearGarbageAfterSnapshot<span class="op">();</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="op">...</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>snapshot<span class="op">.</span>reset<span class="op">();</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p><code>clearGarbageAfterSnapshot</code> calls <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/SnapshotableHashTable.h#L364-L376"><code>clearOutdatedNodes</code></a>, which goes through <code>snapshot_invalid_iters</code> and erases those nodes from the list. Resetting the snapshot runs its <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Coordination/KeeperSnapshotManager.cpp#L624-L628">destructor</a>, which turns snapshot mode off.</p>
+<hr>
+</section>
+</section>
+<section id="summary" class="level3">
+<h3 class="anchored" data-anchor-id="summary">Summary</h3>
+<p>We wanted to snapshot a large in-memory hash map to disk without blocking writes. ClickHouse Keeper does it with two simple data structures: a hash map for constant-time lookups, and a doubly linked list where the data actually lives.</p>
+<p>When a snapshot starts, it marks a cut-off line in the list. After that, new and updated values go after the line, and deleted or replaced nodes stay in the list, marked inactive. The snapshot thread writes the first N nodes without blocking anyone, and a quick cleanup at the end removes the inactive nodes.</p>
+<hr>
+</section>
+<section id="credits-and-resources" class="level3">
+<h3 class="anchored" data-anchor-id="credits-and-resources">Credits and Resources</h3>
+<p>For this post, I have heavily used Claude Code. Along with that, I have relied on the following resources:</p>
+<ol type="1">
+<li><a href="https://clickhouse.com/docs/guides/sre/keeper/clickhouse-keeper">ClickHouse Keeper</a>, ClickHouse docs</li>
+<li><a href="https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/">Redis persistence</a>, for how Redis uses <code>fork()</code> for snapshots</li>
+<li><a href="https://github.com/ClickHouse/ClickHouse/tree/v26.2.1.1139-stable/src/Coordination">ClickHouse source code, v26.2.1.1139-stable</a></li>
+</ol>
+<hr>
+
+
+</section>
+
+</main> <!-- /main -->
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/thewalstreetjournal\.github\.io");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+</div> <!-- /content -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+
+
+
+
+</body></html>
