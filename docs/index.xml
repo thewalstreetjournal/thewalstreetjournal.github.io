@@ -8,9 +8,378 @@
 <title>The WAL Street Journal</title>
 <link>https://thewalstreetjournal.github.io/</link>
 <atom:link href="https://thewalstreetjournal.github.io/index.xml" rel="self" type="application/rss+xml"/>
-<description>Database internals, read from the source code.</description>
+<description>I like to explain to myself how databases work.</description>
 <generator>quarto-1.8.26</generator>
-<lastBuildDate>Tue, 06 Oct 2026 18:30:00 GMT</lastBuildDate>
+<lastBuildDate>Wed, 04 Nov 2026 18:30:00 GMT</lastBuildDate>
+<item>
+  <title>A Closer Look at DataFusion Preimage Rewrites</title>
+  <link>https://thewalstreetjournal.github.io/posts/a-closer-look-at-datafusion-preimage-rewrites/</link>
+  <description><![CDATA[ 
+
+
+
+
+
+
+<p>Recently, in the Apache DataFusion, a <a href="https://github.com/apache/datafusion/issues/26910">bug</a> was reported where a predicate like <code>floor(random() * 10) = 3</code> was being split into two predicates like this: <code>random() * 10 &gt;= 3 AND random() * 10 &lt; 4</code>. The <code>random()</code> function was being evaluated twice and thus, the query results were incorrect.</p>
+<p>But why does DataFusion split an equality predicate into two range predicates? This is called a “Preimage Rewrite”, and that’s what we will cover in this post.</p>
+<section id="what-is-a-preimage" class="level2">
+<h2 class="anchored" data-anchor-id="what-is-a-preimage">What is a Preimage?</h2>
+<p>A quick math revision:</p>
+<p>For a given set of inputs of a function, the corresponding set of outputs is called as the image. And for a given set of outputs of a function, the corresponding set of inputs is called as the preimage.</p>
+<p>For example, say we have a function: <img src="https://latex.codecogs.com/png.latex?f(x)%20=%20x%5E2">. And let’s assume the set of outputs as: <img src="https://latex.codecogs.com/png.latex?%5C%7B4,%209%5C%7D">. Then the preimage for this set is this set <img src="https://latex.codecogs.com/png.latex?%5C%7B-2,%202,%20-3,%203%5C%7D">.</p>
+<p>Consider another function: <code>floor(x)</code>. And assume the set of output as: <img src="https://latex.codecogs.com/png.latex?%5C%7B3%5C%7D">. The preimage for this is the range: <img src="https://latex.codecogs.com/png.latex?%5B3,%204)">.</p>
+</section>
+<section id="why-does-datafusion-care-about-preimages" class="level2">
+<h2 class="anchored" data-anchor-id="why-does-datafusion-care-about-preimages">Why Does DataFusion Care About Preimages?</h2>
+<p>Let’s try to connect this back to a predicate that we can get in DataFusion: <code>floor(col) = 3</code>. Based on the preimage knowledge, we know that only an input from <img src="https://latex.codecogs.com/png.latex?%5B3,%204)"> range can satisfy this predicate.</p>
+<p>So, it can be proven that the following holds:</p>
+<p><img src="https://latex.codecogs.com/png.latex?%0A%5Coperatorname%7Bfloor%7D(col)%20=%203%0A%5Ciff%0Acol%20%5Cgeq%203%20%5C;%5Ctext%7BAND%7D%5C;%20col%20%3C%204%0A"></p>
+<p>This may not always be possible, but for functions like <code>floor</code>, this may be possible. And query engines take advantage of this.</p>
+<p>But how does this help in executing a query faster?</p>
+<p>Suppose we are reading a Parquet file, and one row group contains col values between 100 and 200. Its metadata records these minimum and maximum values. Once our predicate becomes <code>col &gt;= 3 AND col &lt; 4</code>, the engine can compare the requested range with those statistics and skip the row group. It doesn’t need to read the column values or calculate floor() for those rows. With the original <code>floor(col) = 3</code> predicate, this opportunity is harder to recognize.</p>
+<p>Along with file formats like Parquet, many databases also keep statistics like min and max values.</p>
+<p>So, range predicates matter because:</p>
+<ol type="1">
+<li>Databases and file formats keep statistics about the data</li>
+<li>These statistics naturally support range predicates and thus, data that does not need to be read can be entirely skipped.</li>
+</ol>
+<p>Note that this is based on the assumption that the database, or the file format, keeps such statistics. If it does not, then we may not be able to prune data using preimage rewrites.</p>
+</section>
+<section id="how-datafusion-does-it-in-code" class="level2">
+<h2 class="anchored" data-anchor-id="how-datafusion-does-it-in-code">How DataFusion Does It in Code?</h2>
+<p>Inside DataFusion, the predicate <code>floor(col) = 3</code> looks something like this:</p>
+<pre><code>          =
+         / \
+      floor  3
+        |
+       col</code></pre>
+<p>DataFusion represents expressions, including predicates, using the <code>Expr</code> enum:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2" style="background: #f1f3f5;"><pre class="sourceCode rust code-with-copy"><code class="sourceCode rust"><span id="cb2-1"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">pub</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">enum</span> Expr <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb2-2">    <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/// An expression with a specific name.</span></span>
+<span id="cb2-3">    Alias(Alias)<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span></span>
+<span id="cb2-4">    <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/// A named reference to a qualified field in a schema.</span></span>
+<span id="cb2-5">    Column(Column)<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span></span>
+<span id="cb2-6">    <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/// A named reference to a variable in a registry.</span></span>
+<span id="cb2-7">    ScalarVariable(FieldRef<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">Vec</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&lt;</span><span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">String</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&gt;</span>)<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span></span>
+<span id="cb2-8">    <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/// A constant value along with associated [`FieldMetadata`].</span></span>
+<span id="cb2-9">    Literal(ScalarValue<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">Option</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&lt;</span>FieldMetadata<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&gt;</span>)<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span></span>
+<span id="cb2-10">    <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/// A binary expression such as "age &gt; 21"</span></span>
+<span id="cb2-11">    BinaryExpr(BinaryExpr)<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span></span>
+<span id="cb2-12">    <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">// Other variants</span></span>
+<span id="cb2-13"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span></span></code></pre></div></div>
+<p>Within this enum, our expression is of the variant: <code>BinaryExpr</code>.</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3" style="background: #f1f3f5;"><pre class="sourceCode rust code-with-copy"><code class="sourceCode rust"><span id="cb3-1"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">pub</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">struct</span> BinaryExpr <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb3-2">    <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/// Left-hand side of the expression</span></span>
+<span id="cb3-3">    <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">pub</span> left<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">:</span> <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">Box</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&lt;</span>Expr<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&gt;,</span></span>
+<span id="cb3-4">    <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/// The comparison operator</span></span>
+<span id="cb3-5">    <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">pub</span> op<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">:</span> Operator<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span></span>
+<span id="cb3-6">    <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">/// Right-hand side of the expression</span></span>
+<span id="cb3-7">    <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">pub</span> right<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">:</span> <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">Box</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&lt;</span>Expr<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&gt;,</span></span>
+<span id="cb3-8"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span></span></code></pre></div></div>
+<p>For our predicate, <code>left</code> is <code>floor(col)</code>, <code>op</code> is <code>Eq</code>, and <code>right</code> is <code>3</code>.</p>
+<p>In the DataFusion optimizer, there is a rule called <code>SimplifyExpressions</code>, which we are interested in.</p>
+<p>The SimplifyExpressions rule uses an expression simplifier to apply algebraic rewrites. The <code>floor(col) = 3</code> predicate fits into this.</p>
+<p>In our case, the simplifier does this:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4" style="background: #f1f3f5;"><pre class="sourceCode rust code-with-copy"><code class="sourceCode rust"><span id="cb4-1"><span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">if</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">let</span> <span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">PreimageResult::</span>Range <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span> interval<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> expr <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span></span>
+<span id="cb4-2">    get_preimage(left<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>as_ref()<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> right<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>as_ref()<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> info)<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">?</span></span>
+<span id="cb4-3"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb4-4">    rewrite_with_preimage(<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">*</span>interval<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> op<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> expr)<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">?</span> <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">// We'll see this method towards the end of the blog. Remember it!</span></span>
+<span id="cb4-5"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span></span></code></pre></div></div>
+<p><code>get_preimage()</code> checks whether the expression is eligible, which we don’t need to get into for now.</p>
+<p>It then calls the function’s <code>preimage()</code> implementation.</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5" style="background: #f1f3f5;"><pre class="sourceCode rust code-with-copy"><code class="sourceCode rust"><span id="cb5-1"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">fn</span> get_preimage(</span>
+<span id="cb5-2">    left_expr<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">:</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&amp;</span>Expr<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span></span>
+<span id="cb5-3">    right_expr<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">:</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&amp;</span>Expr<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span></span>
+<span id="cb5-4">    info<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">:</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&amp;</span>SimplifyContext<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span></span>
+<span id="cb5-5">) <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-&gt;</span> <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">Result</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&lt;</span>PreimageResult<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&gt;</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb5-6">    <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">let</span> <span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">Expr::</span>ScalarFunction(ScalarFunction <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span> func<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> args <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span>) <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> left_expr <span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">else</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb5-7">        <span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">return</span> <span class="cn" style="color: #8f5902;
+background-color: null;
+font-style: inherit;">Ok</span>(<span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">PreimageResult::</span><span class="cn" style="color: #8f5902;
+background-color: null;
+font-style: inherit;">None</span>)<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb5-8">    <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">};</span></span>
+<span id="cb5-9"></span>
+<span id="cb5-10">    <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">// Eligibility checks omitted.</span></span>
+<span id="cb5-11"></span>
+<span id="cb5-12">    func<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>preimage(args<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> right_expr<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> info)</span>
+<span id="cb5-13"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span></span></code></pre></div></div>
+<p>Each function computes its own preimage. The optimizer does not need to know about function specific rewrites. In our case, the <code>floor()</code> function computes its own preimage and returns a result like this:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6" style="background: #f1f3f5;"><pre class="sourceCode rust code-with-copy"><code class="sourceCode rust"><span id="cb6-1"><span class="cn" style="color: #8f5902;
+background-color: null;
+font-style: inherit;">Ok</span>(<span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">PreimageResult::</span>Range <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb6-2">    expr<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">:</span> arg<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span></span>
+<span id="cb6-3">    interval<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">:</span> <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">Box</span><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">::</span>new(<span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">Interval::</span>try_new(lower<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> upper)<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">?</span>)<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span></span>
+<span id="cb6-4"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span>)</span></code></pre></div></div>
+<p>For <code>floor(col) = 3</code>, this describes the input range [3, 4), and <code>arg</code> is the expression referring to col.</p>
+<p>This <code>PreimageResult::Range</code> is then rewritten into an <code>Expr</code>, and the optimizations continue. This happens in the <code>rewrite_with_preimage()</code> method.</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb7" style="background: #f1f3f5;"><pre class="sourceCode rust code-with-copy"><code class="sourceCode rust"><span id="cb7-1"><span class="pp" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">Operator::</span><span class="bu" style="color: null;
+background-color: null;
+font-style: inherit;">Eq</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=&gt;</span> and(expr<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>clone()<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>gt_eq(lower)<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> expr<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>lt(upper))<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span></span></code></pre></div></div>
+<p>Here, <code>expr</code> refers to col, and the bounds are 3 and 4. The methods construct two comparison expressions and join them with AND, giving us <code>col &gt;= 3 AND col &lt; 4</code>. The <code>floor()</code> call is no longer part of the predicate.</p>
+<p>We no longer have the equality predicate, but now we have the range predicate that lets the engine apply the pruning.</p>
+</section>
+<section id="references" class="level2">
+<h2 class="anchored" data-anchor-id="references">References</h2>
+<ul>
+<li><a href="https://github.com/apache/datafusion/issues/26910">Original issue: Preimage evaluates a volatile argument two times</a></li>
+<li><a href="https://github.com/apache/datafusion/blob/238ae32697e3a18d7d9332f3b05277815fdd99b3/datafusion/expr/src/expr.rs#L314">Expression types: <code>Expr</code> and <code>BinaryExpr</code></a></li>
+<li><a href="https://github.com/apache/datafusion/blob/238ae32697e3a18d7d9332f3b05277815fdd99b3/datafusion/optimizer/src/simplify_expressions/expr_simplifier.rs#L2121"><code>get_preimage()</code></a></li>
+</ul>
+
+
+</section>
+
+ ]]></description>
+  <category>datafusion</category>
+  <category>internals</category>
+  <category>query-optimization</category>
+  <guid>https://thewalstreetjournal.github.io/posts/a-closer-look-at-datafusion-preimage-rewrites/</guid>
+  <pubDate>Wed, 04 Nov 2026 18:30:00 GMT</pubDate>
+  <media:content url="https://thewalstreetjournal.github.io/posts/a-closer-look-at-datafusion-preimage-rewrites/preimage-rewrite.png" medium="image" type="image/png" height="81" width="144"/>
+</item>
 <item>
   <title>How ClickHouse Keeper Takes Non-Blocking Snapshots</title>
   <link>https://thewalstreetjournal.github.io/posts/clickhouse-keeper-non-blocking-snapshots/</link>

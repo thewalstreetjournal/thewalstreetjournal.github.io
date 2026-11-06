@@ -1,6 +1,6 @@
 ---
 title: "The WAL Street Journal"
-description: "Database internals, read from the source code."
+description: "I like to explain to myself how databases work."
 listing:
   contents: posts
   sort: "date desc"

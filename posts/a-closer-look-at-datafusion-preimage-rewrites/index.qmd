@@ -1,0 +1,171 @@
+---
+title: "A Closer Look at DataFusion Preimage Rewrites"
+date: "2026-11-05"
+categories: [datafusion, internals, query-optimization]
+code-fold: true
+description: "How DataFusion turns function comparisons into range predicates."
+image: preimage-rewrite.png
+image-alt: "Expression tree for floor(col) = 3 rewritten into col >= 3 AND col < 4."
+---
+
+Recently, in the Apache DataFusion, a [bug](https://github.com/apache/datafusion/issues/26910) was reported where a predicate
+like `floor(random() * 10) = 3` was being split into two predicates like this: `random() * 10 >= 3 AND random() * 10 < 4`.
+The `random()` function was being evaluated twice and thus, the query results were incorrect.
+
+But why does DataFusion split an equality predicate into two range predicates? This is called a "Preimage Rewrite",
+and that's what we will cover in this post.
+
+## What is a Preimage?
+
+A quick math revision:
+
+For a given set of inputs of a function, the corresponding set of outputs is called as the image.
+And for a given set of outputs of a function, the corresponding set of inputs is called as the preimage.
+
+For example, say we have a function: $f(x) = x^2$. And let's assume the set of outputs as: $\{4, 9\}$.
+Then the preimage for this set is this set $\{-2, 2, -3, 3\}$.
+
+Consider another function: `floor(x)`. And assume the set of output as: $\{3\}$. The preimage for this is the range: $[3, 4)$.
+
+## Why Does DataFusion Care About Preimages?
+
+Let's try to connect this back to a predicate that we can get in DataFusion: `floor(col) = 3`.
+Based on the preimage knowledge, we know that only an input from $[3, 4)$ range can satisfy this predicate.
+
+So, it can be proven that the following holds:
+
+$$
+\operatorname{floor}(col) = 3
+\iff
+col \geq 3 \;\text{AND}\; col < 4
+$$
+
+This may not always be possible, but for functions like `floor`, this may be possible. And query engines take advantage of this.
+
+But how does this help in executing a query faster?
+
+Suppose we are reading a Parquet file, and one row group contains col values between 100 and 200.
+Its metadata records these minimum and maximum values.
+Once our predicate becomes `col >= 3 AND col < 4`, the engine can compare the requested range with those statistics and skip the row group.
+It doesn't need to read the column values or calculate floor() for those rows.
+With the original `floor(col) = 3` predicate, this opportunity is harder to recognize.
+
+Along with file formats like Parquet, many databases also keep statistics like min and max values.
+
+So, range predicates matter because:
+
+1) Databases and file formats keep statistics about the data
+2) These statistics naturally support range predicates and thus, data that does not need to be read can be entirely skipped.
+
+Note that this is based on the assumption that the database, or the file format, keeps such statistics.
+If it does not, then we may not be able to prune data using preimage rewrites.
+
+## How DataFusion Does It in Code?
+
+Inside DataFusion, the predicate `floor(col) = 3` looks something like this:
+
+```
+          =
+         / \
+      floor  3
+        |
+       col
+```
+
+DataFusion represents expressions, including predicates, using the `Expr` enum:
+
+```rust
+pub enum Expr {
+    /// An expression with a specific name.
+    Alias(Alias),
+    /// A named reference to a qualified field in a schema.
+    Column(Column),
+    /// A named reference to a variable in a registry.
+    ScalarVariable(FieldRef, Vec<String>),
+    /// A constant value along with associated [`FieldMetadata`].
+    Literal(ScalarValue, Option<FieldMetadata>),
+    /// A binary expression such as "age > 21"
+    BinaryExpr(BinaryExpr),
+    // Other variants
+}
+```
+
+Within this enum, our expression is of the variant: `BinaryExpr`.
+
+```rust
+pub struct BinaryExpr {
+    /// Left-hand side of the expression
+    pub left: Box<Expr>,
+    /// The comparison operator
+    pub op: Operator,
+    /// Right-hand side of the expression
+    pub right: Box<Expr>,
+}
+```
+
+For our predicate, `left` is `floor(col)`, `op` is `Eq`, and `right` is `3`.
+
+In the DataFusion optimizer, there is a rule called `SimplifyExpressions`, which we are interested in.
+
+The SimplifyExpressions rule uses an expression simplifier to apply algebraic rewrites. The `floor(col) = 3` predicate fits into this.
+
+In our case, the simplifier does this:
+
+```rust
+if let PreimageResult::Range { interval, expr } =
+    get_preimage(left.as_ref(), right.as_ref(), info)?
+{
+    rewrite_with_preimage(*interval, op, expr)? // We'll see this method towards the end of the blog. Remember it!
+}
+```
+
+`get_preimage()` checks whether the expression is eligible, which we don't need to get into for now.
+
+It then calls the function's `preimage()` implementation.
+
+```rust
+fn get_preimage(
+    left_expr: &Expr,
+    right_expr: &Expr,
+    info: &SimplifyContext,
+) -> Result<PreimageResult> {
+    let Expr::ScalarFunction(ScalarFunction { func, args }) = left_expr else {
+        return Ok(PreimageResult::None);
+    };
+
+    // Eligibility checks omitted.
+
+    func.preimage(args, right_expr, info)
+}
+```
+
+Each function computes its own preimage. The optimizer does not need to know about function specific rewrites.
+In our case, the `floor()` function computes its own preimage and returns a result like this:
+
+
+```rust
+Ok(PreimageResult::Range {
+    expr: arg,
+    interval: Box::new(Interval::try_new(lower, upper)?),
+})
+```
+
+For `floor(col) = 3`, this describes the input range [3, 4), and `arg` is the expression referring to col.
+
+This `PreimageResult::Range` is then rewritten into an `Expr`, and the optimizations continue. This happens in the `rewrite_with_preimage()`
+method.
+
+```rust
+Operator::Eq => and(expr.clone().gt_eq(lower), expr.lt(upper)),
+```
+
+Here, `expr` refers to col, and the bounds are 3 and 4. The methods construct two comparison expressions and join them with AND,
+giving us `col >= 3 AND col < 4`. The `floor()` call is no longer part of the predicate.
+
+We no longer have the equality predicate, but now we have the range predicate that lets the engine apply the pruning.
+
+## References
+
+- [Original issue: Preimage evaluates a volatile argument two times](https://github.com/apache/datafusion/issues/26910)
+- [Expression types: `Expr` and `BinaryExpr`](https://github.com/apache/datafusion/blob/238ae32697e3a18d7d9332f3b05277815fdd99b3/datafusion/expr/src/expr.rs#L314)
+- [`get_preimage()`](https://github.com/apache/datafusion/blob/238ae32697e3a18d7d9332f3b05277815fdd99b3/datafusion/optimizer/src/simplify_expressions/expr_simplifier.rs#L2121)

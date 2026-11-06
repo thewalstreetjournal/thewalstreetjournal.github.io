@@ -2,6 +2,7 @@
   {
     "listing": "/index.html",
     "items": [
+      "/posts/a-closer-look-at-datafusion-preimage-rewrites/index.html",
       "/posts/clickhouse-keeper-non-blocking-snapshots/index.html",
       "/posts/inside-the-postgres-wal/index.html",
       "/posts/postgres-free-space-map/index.html",

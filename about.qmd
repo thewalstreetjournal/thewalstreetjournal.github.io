@@ -2,9 +2,10 @@
 title: "About"
 ---
 
-I read database source code and write about what I find.
+My name is Vikrant. I like databases and system software. This blog is an attempt to explain to myself how databases work.
 
-Right now that's mostly PostgreSQL and ClickHouse. I'm trying to explore more OLAP databases going forward. Typically, I put a video on my [YouTube channel](https://www.youtube.com/@TheWALStreetJournal), for each blog post.
+Right now, this mostly means topics around Postgres and ClickHouse. I'm trying to explore more OLAP databases going forward.
+Typically, I put a video on my [YouTube channel](https://www.youtube.com/@TheWALStreetJournal), for each blog post.
 
 ## Get new posts by email
 
