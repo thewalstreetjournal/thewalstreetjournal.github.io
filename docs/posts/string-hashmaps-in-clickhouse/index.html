@@ -1,0 +1,1144 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.8.26">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+<meta name="dcterms.date" content="2026-11-06">
+<meta name="description" content="ClickHouse stores short string keys as integers. A walkthrough of its string-adaptive hash table, including how its eight-byte reads handle memory boundaries.">
+
+<title>How ClickHouse Turns Strings Into Integers for Faster Hash Tables – The WAL Street Journal</title>
+<style>
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: min(4vw, 1.5em);}
+div.column{flex: auto; overflow-x: auto;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="../../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../../">
+<link href="../../favicon.png" rel="icon" type="image/png">
+<script src="../../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../../site_libs/quarto-html/axe/axe-check.js" type="module"></script>
+<script src="../../site_libs/quarto-html/popper.min.js"></script>
+<script src="../../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../../site_libs/quarto-html/quarto-syntax-highlighting-587c61ba64f3a5504c4d52d930310e48.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../../site_libs/quarto-html/quarto-syntax-highlighting-dark-b758ccaa5987ceb1b75504551e579abf.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../../site_libs/quarto-html/quarto-syntax-highlighting-587c61ba64f3a5504c4d52d930310e48.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../../site_libs/bootstrap/bootstrap-4b2f21892da54ec5b138bd6f8a390d32.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../../site_libs/bootstrap/bootstrap-dark-743ce29ad2e07205429a880e211ee2ec.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../../site_libs/bootstrap/bootstrap-4b2f21892da54ec5b138bd6f8a390d32.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+<script async="" src="https://www.googletagmanager.com/gtag/js?id=G-NMYW1XQTP9"></script>
+
+<script type="text/javascript">
+
+window.dataLayer = window.dataLayer || [];
+function gtag(){dataLayer.push(arguments);}
+gtag('js', new Date());
+gtag('config', 'G-NMYW1XQTP9', { 'anonymize_ip': true});
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
+<link href="https://fonts.googleapis.com/css2?family=Sofia&amp;family=Playfair+Display:wght@700&amp;display=swap" rel="stylesheet">
+
+
+<link rel="stylesheet" href="../../styles.css">
+<meta property="og:title" content="How ClickHouse Turns Strings Into Integers for Faster Hash Tables – The WAL Street Journal">
+<meta property="og:description" content="ClickHouse stores short string keys as integers. A walkthrough of its string-adaptive hash table, including how its eight-byte reads handle memory boundaries.">
+<meta property="og:image" content="https://thewalstreetjournal.github.io/posts/string-hashmaps-in-clickhouse/string-dispatch.png">
+<meta property="og:site_name" content="The WAL Street Journal">
+<meta property="og:image:height" content="2160">
+<meta property="og:image:width" content="3840">
+<meta property="og:image:alt" content="A dispatcher routes string keys to five stores: empty, 8-byte, 16-byte, 24-byte, and a generic string table.">
+<meta name="twitter:title" content="How ClickHouse Turns Strings Into Integers for Faster Hash Tables – The WAL Street Journal">
+<meta name="twitter:description" content="ClickHouse stores short string keys as integers. A walkthrough of its string-adaptive hash table, including how its eight-byte reads handle memory boundaries.">
+<meta name="twitter:image" content="https://thewalstreetjournal.github.io/posts/string-hashmaps-in-clickhouse/string-dispatch.png">
+<meta name="twitter:image-height" content="2160">
+<meta name="twitter:image-width" content="3840">
+<meta name="twitter:image:alt" content="A dispatcher routes string keys to five stores: empty, 8-byte, 16-byte, 24-byte, and a generic string table.">
+<meta name="twitter:card" content="summary_large_image">
+</head>
+
+<body class="nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top quarto-banner">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a class="navbar-brand" href="../../index.html">
+    <span class="navbar-title">The WAL Street Journal</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link" href="../../index.html"> 
+<span class="menu-text">Blog</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="../../about.html"> 
+<span class="menu-text">About</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/thewalstreetjournal"> <i class="bi bi-github" role="img">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://www.youtube.com/@TheWALStreetJournal"> <i class="bi bi-youtube" role="img">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+  <li class="nav-item compact">
+    <a class="nav-link" href="../../index.xml"> <i class="bi bi-rss" role="img">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+</header>
+<!-- content -->
+<header id="title-block-header" class="quarto-title-block default page-columns page-full">
+  <div class="quarto-title-banner page-columns page-full">
+    <div class="quarto-title column-body">
+      <h1 class="title">How ClickHouse Turns Strings Into Integers for Faster Hash Tables</h1>
+                  <div>
+        <div class="description">
+          ClickHouse stores short string keys as integers. A walkthrough of its string-adaptive hash table, including how its eight-byte reads handle memory boundaries.
+        </div>
+      </div>
+                          <div class="quarto-categories">
+                <div class="quarto-category">clickhouse</div>
+                <div class="quarto-category">internals</div>
+                <div class="quarto-category">hash-tables</div>
+              </div>
+                  </div>
+  </div>
+    
+  
+  <div class="quarto-title-meta">
+
+      
+      <div>
+      <div class="quarto-title-meta-heading">Published</div>
+      <div class="quarto-title-meta-contents">
+        <p class="date">November 6, 2026</p>
+      </div>
+    </div>
+    
+      
+    </div>
+    
+  
+  </header><div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#why-string-keys-make-hash-tables-work-harder" id="toc-why-string-keys-make-hash-tables-work-harder" class="nav-link active" data-scroll-target="#why-string-keys-make-hash-tables-work-harder">Why string keys make hash tables work harder</a></li>
+  <li><a href="#two-tables-and-a-dispatcher" id="toc-two-tables-and-a-dispatcher" class="nav-link" data-scroll-target="#two-tables-and-a-dispatcher">Two tables and a dispatcher</a></li>
+  <li><a href="#loading-five-bytes-as-eight" id="toc-loading-five-bytes-as-eight" class="nav-link" data-scroll-target="#loading-five-bytes-as-eight">Loading five bytes as eight</a></li>
+  <li><a href="#in-the-source-code" id="toc-in-the-source-code" class="nav-link" data-scroll-target="#in-the-source-code">In the source code</a></li>
+  <li><a href="#summary" id="toc-summary" class="nav-link" data-scroll-target="#summary">Summary</a></li>
+  <li><a href="#credits-and-resources" id="toc-credits-and-resources" class="nav-link" data-scroll-target="#credits-and-resources">Credits and Resources</a></li>
+  </ul>
+</nav>
+    </div>
+<!-- main -->
+<main class="content quarto-banner-title-block" id="quarto-document-content">
+
+
+
+
+
+
+<p>When we run a <code>GROUP BY</code> query on a string column, ClickHouse has a hash table that tries to treat the strings as integers. Why?</p>
+<p>Because short strings can fit directly inside a hash-table slot. We can hash and compare them as integers, without following a pointer to the string’s bytes somewhere else in memory.</p>
+<p>This design comes from <a href="https://www.mdpi.com/2076-3417/10/6/1915">SAHA: A String Adaptive Hash Table for Analytical Databases</a>. The paper reports improvements of up to five times over the hash tables it evaluated. Those are hash-table benchmark results, rather than a promise that every <code>GROUP BY</code> query becomes five times faster.</p>
+<p>Let’s build up the idea, then find it in the ClickHouse source. We’ll also cover the memory-safety detail I skipped in the video: how can we read eight bytes when a string only contains five?</p>
+<p>Prefer video? Here’s the same walkthrough:</p>
+<div class="quarto-video ratio ratio-16x9"><iframe data-external="1" src="https://www.youtube.com/embed/wFCXI9P6Trg" title="" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen=""></iframe></div>
+<hr>
+<section id="why-string-keys-make-hash-tables-work-harder" class="level3">
+<h3 class="anchored" data-anchor-id="why-string-keys-make-hash-tables-work-harder">Why string keys make hash tables work harder</h3>
+<p>Consider this query:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> country, <span class="fu">count</span>()</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> visits</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">GROUP</span> <span class="kw">BY</span> country;</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Conceptually, the aggregation hash table holds the country as its key and the count as its value.</p>
+<p>The slots in a hash table have a fixed size, but strings can be arbitrarily long. One common representation is a pointer and a length in the slot, with the actual bytes stored elsewhere. ClickHouse’s generic string-key representation uses a <code>std::string_view</code> like this.</p>
+<p>Say we’re looking up <code>India</code>, and its hash sends us to slot 5. We inspect the slot, follow the pointer, and find the bytes for <code>Japan</code>. The key doesn’t match, so we probe another slot and potentially follow another pointer.</p>
+<p><img src="pointer-lookup.svg" class="img-fluid" alt="Looking up India: slot 5 points to Japan in separate string storage; slot 6 points to India. Both comparisons require following a pointer."></p>
+<p>The table’s slots are close together, but the strings they point to may be in different cache lines. When a comparison needs those bytes, it can cause another cache miss. Length checks and saved hashes can avoid some comparisons, but the indirection is still there when we need to inspect a string.</p>
+<p>Many useful grouping keys are short: country codes, status labels, and names like <code>India</code>. So why follow a pointer when the bytes would fit inside the slot itself?</p>
+<hr>
+</section>
+<section id="two-tables-and-a-dispatcher" class="level3">
+<h3 class="anchored" data-anchor-id="two-tables-and-a-dispatcher">Two tables and a dispatcher</h3>
+<p>At a high level, we could start with two implementations:</p>
+<ol type="1">
+<li>An optimized table for short strings, say eight bytes or fewer, storing the bytes directly in each slot.</li>
+<li>A fallback table for longer strings, storing a pointer and a length.</li>
+</ol>
+<p>A dispatcher receives an operation, checks the key’s length, and forwards it to the appropriate table. The caller still sees one hash-table interface.</p>
+<p>The long-string table is familiar. The interesting question is how we represent a short key.</p>
+<section id="doesnt-c-already-have-small-string-optimization" class="level4">
+<h4 class="anchored" data-anchor-id="doesnt-c-already-have-small-string-optimization">Doesn’t C++ already have small string optimization?</h4>
+<p>It does. With <strong>small string optimization</strong>, or SSO, a <code>std::string</code> can keep short strings inside the string object instead of allocating a separate buffer.</p>
+<p>But the object still carries metadata. Common implementations make a <code>std::string</code> object 24 or 32 bytes, depending on the standard library and ABI. That size applies whether the object lives on the stack, on the heap, or inside a hash-table slot.</p>
+<p>If our key only needs eight bytes, that’s a lot of space per aggregation bucket. Across millions of buckets, larger cells also mean fewer keys fit in a cache line.</p>
+<p>Instead, we can store those eight bytes as a plain <code>UInt64</code>:</p>
+<pre class="text"><code>string bytes:  I  n  d  i  a
+stored bytes:  I  n  d  i  a  0  0  0</code></pre>
+<p>On a little-endian machine, that integer is <code>0x0000006169646e49</code>. We’re preserving the character bytes, rather than parsing the text as a decimal number or replacing it with a hash.</p>
+<p>This gives us three useful properties:</p>
+<ol type="1">
+<li><strong>Compact keys.</strong> The key occupies eight bytes, excluding the count or other mapped value stored alongside it.</li>
+<li><strong>Fixed-size comparisons.</strong> We can compare the packed keys as integers. A string comparison can also use wide loads, but it has to handle a variable length.</li>
+<li><strong>Cheap hashing.</strong> We can feed the packed word directly to a hash function designed for fixed-size input.</li>
+</ol>
+<p>The integer is the key itself. A separate hash chooses the table slot, and collisions are still resolved by comparing keys.</p>
+<hr>
+</section>
+</section>
+<section id="loading-five-bytes-as-eight" class="level3">
+<h3 class="anchored" data-anchor-id="loading-five-bytes-as-eight">Loading five bytes as eight</h3>
+<p>How do we turn <code>India</code> into that integer?</p>
+<p>The straightforward, portable way is to initialize an integer to zero, then copy the string’s bytes into it:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// For a key of at most eight bytes.</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="dt">uint64_t</span> key <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>memcpy<span class="op">(&amp;</span>key<span class="op">,</span> data<span class="op">,</span> size<span class="op">);</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>For <code>India</code>, this copies five bytes and leaves three zero bytes. It is safe for an ordinary five-byte buffer.</p>
+<p>The difficulty is that <code>size</code> varies at runtime. Depending on the compiler and target, a variable-length copy can need several loads or branches to handle the different lengths. The CPU can copy five bytes; the point is to give it a simpler, fixed-size operation in this very hot path.</p>
+<p>ClickHouse instead loads a full eight-byte word, then removes the bytes that don’t belong to the key. A fixed eight-byte <code>memcpy</code> can compile to a single unaligned load on x86-64.</p>
+<p><img src="packing-india.svg" class="img-fluid" alt="India is loaded together with three neighboring bytes. Masking removes the neighboring bytes, leaving I n d i a followed by three zero bytes, an eight-byte integer key."></p>
+<p>This reduces the work inside each size class. There are still branches for dispatching and for choosing a safe load direction. It doesn’t make the entire operation branch-free.</p>
+<p>And we can’t just read past a buffer because we plan to throw those bytes away. We’ll return to that when we reach the load in the source.</p>
+<hr>
+</section>
+<section id="in-the-source-code" class="level3">
+<h3 class="anchored" data-anchor-id="in-the-source-code">In the source code</h3>
+<p><a href="https://github.com/ClickHouse/ClickHouse">ClickHouse</a> is an open-source OLAP database with a framework of specialized hash tables. Its <a href="https://clickhouse.com/blog/hash-tables-in-clickhouse-and-zero-cost-abstractions">hash-table design post</a> gives a broader tour. Here, we’ll focus on the string-adaptive table.</p>
+<p>The code below is from <a href="https://github.com/ClickHouse/ClickHouse/tree/v26.2.1.1139-stable/src/Common/HashTable">v26.2.1.1139-stable</a>. ClickHouse has several aggregation paths; this is the string hash-table implementation we’re exploring, rather than a claim that every string grouping uses this exact path.</p>
+<section id="five-stores-behind-one-interface" class="level4">
+<h4 class="anchored" data-anchor-id="five-stores-behind-one-interface">Five stores behind one interface</h4>
+<p>In <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Common/HashTable/StringHashTable.h#L252-L256"><code>StringHashTable.h</code></a>, the <code>StringHashTable</code> class contains:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>T0 m0<span class="op">;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>T1 m1<span class="op">;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>T2 m2<span class="op">;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>T3 m3<span class="op">;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>Ts ms<span class="op">;</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>We started with two tables. ClickHouse takes the idea further:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 33%">
+<col style="width: 33%">
+<col style="width: 33%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Store</th>
+<th>Keys</th>
+<th>Representation</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>m0</code></td>
+<td>Empty string</td>
+<td>A dedicated cell</td>
+</tr>
+<tr class="even">
+<td><code>m1</code></td>
+<td>1–8 bytes</td>
+<td>One <code>UInt64</code></td>
+</tr>
+<tr class="odd">
+<td><code>m2</code></td>
+<td>9–16 bytes</td>
+<td>A <code>UInt128</code>, made of two 64-bit words</td>
+</tr>
+<tr class="even">
+<td><code>m3</code></td>
+<td>17–24 bytes</td>
+<td>A struct of three <code>UInt64</code> words</td>
+</tr>
+<tr class="odd">
+<td><code>ms</code></td>
+<td>25 bytes or more, <strong>or any nonempty key ending in a zero byte</strong></td>
+<td><code>std::string_view</code> with a saved hash</td>
+</tr>
+</tbody>
+</table>
+<p>The concrete map types are wired together in <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Common/HashTable/StringHashMap.h#L74-L85"><code>StringHashMap.h</code></a>. The nonempty subtables grow independently, so inserting a key in <code>m1</code> doesn’t require resizing all the others.</p>
+<p><img src="string-dispatch.svg" class="img-fluid" alt="A string key enters the dispatcher, which chooses m0 for an empty key, m1 for 1–8 bytes, m2 for 9–16 bytes, m3 for 17–24 bytes, or ms for longer keys. Keys ending in a zero byte also go to ms."></p>
+</section>
+<section id="the-dispatcher" class="level4">
+<h4 class="anchored" data-anchor-id="the-dispatcher">The dispatcher</h4>
+<p><a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Common/HashTable/StringHashTable.h#L295-L334"><code>dispatch</code></a> receives the key and a callable describing the operation to perform. First, it handles two special cases:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="at">const</span> <span class="kw">auto</span> <span class="op">&amp;</span> x <span class="op">=</span> keyHolderGetKey<span class="op">(</span>key_holder<span class="op">);</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="at">const</span> <span class="dt">size_t</span> sz <span class="op">=</span> x<span class="op">.</span>size<span class="op">();</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>sz <span class="op">==</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    keyHolderDiscardKey<span class="op">(</span>key_holder<span class="op">);</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> func<span class="op">(</span>self<span class="op">.</span>m0<span class="op">,</span> VoidKey<span class="op">{},</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>x<span class="op">[</span>sz <span class="op">-</span> <span class="dv">1</span><span class="op">]</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> func<span class="op">(</span>self<span class="op">.</span>ms<span class="op">,</span> <span class="bu">std::</span>forward<span class="op">&lt;</span>KeyHolder<span class="op">&gt;(</span>key_holder<span class="op">),</span> hash<span class="op">(</span>x<span class="op">));</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Why route strings ending in zero to the generic table?</p>
+<p>Because our packed representation doesn’t store an explicit length. <code>India</code> and <code>India\0</code> would produce the same eight-byte value after zero padding. To distinguish them, the latter must use <code>ms</code>, which retains the length. This also lets ClickHouse reconstruct a packed key’s length by counting zero bytes at the end of the word. Embedded zero bytes are fine; the last byte of a packed key must be nonzero.</p>
+<p>Next comes the size dispatch:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="at">const</span> <span class="dt">char</span> <span class="op">*</span> p <span class="op">=</span> x<span class="op">.</span>data<span class="op">();</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="at">const</span> <span class="dt">char</span> s <span class="op">=</span> <span class="op">(-</span>sz <span class="op">&amp;</span> <span class="dv">7</span><span class="op">)</span> <span class="op">*</span> <span class="dv">8</span><span class="op">;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="cf">switch</span> <span class="op">((</span>sz <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">&gt;&gt;</span> <span class="dv">3</span><span class="op">)</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> <span class="dv">0</span><span class="op">:</span> <span class="co">// 1..8 bytes</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Pack into k8 and call func(self.m1, k8, hash(k8)).</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> <span class="dv">1</span><span class="op">:</span> <span class="co">// 9..16 bytes</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Pack into k16 and call func(self.m2, k16, hash(k16)).</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> <span class="dv">2</span><span class="op">:</span> <span class="co">// 17..24 bytes</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Pack into k24 and call func(self.m3, k24, hash(k24)).</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">default</span><span class="op">:</span> <span class="co">// &gt;= 25 bytes</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Forward the string key to ms.</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>This is an outline of the switch; each real case returns after calling the operation.</p>
+<p><code>(sz - 1) &gt;&gt; 3</code> groups lengths into eight-byte ranges. <code>s</code> is the number of bits to clear or shift away in the final word. For five bytes, <code>s</code> is 24. For eight bytes, it’s zero.</p>
+</section>
+<section id="the-memory-safety-detail-where-do-we-load-from" class="level4">
+<h4 class="anchored" data-anchor-id="the-memory-safety-detail-where-do-we-load-from">The memory-safety detail: where do we load from?</h4>
+<p>Here’s the part I left out of the video. In the <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Common/HashTable/StringHashTable.h#L335-L356">1–8 byte case</a>, the little-endian path is equivalent to this:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb7"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Simplified: little-endian path only.</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="dt">uint64_t</span> packed<span class="op">;</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">((</span><span class="kw">reinterpret_cast</span><span class="op">&lt;</span><span class="dt">uintptr_t</span><span class="op">&gt;(</span>p<span class="op">)</span> <span class="op">&amp;</span> <span class="dv">2048</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    memcpy<span class="op">(&amp;</span>packed<span class="op">,</span> p<span class="op">,</span> <span class="dv">8</span><span class="op">);</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    packed <span class="op">&amp;=</span> <span class="op">-</span><span class="dv">1</span><span class="bu">ULL</span> <span class="op">&gt;&gt;</span> s<span class="op">;</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="cf">else</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">char</span> <span class="op">*</span> load_start <span class="op">=</span> p <span class="op">+</span> sz <span class="op">-</span> <span class="dv">8</span><span class="op">;</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>    memcpy<span class="op">(&amp;</span>packed<span class="op">,</span> load_start<span class="op">,</span> <span class="dv">8</span><span class="op">);</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>    packed <span class="op">&gt;&gt;=</span> s<span class="op">;</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>There are two separate issues here: staying within readable memory pages, and satisfying the buffer’s allocation contract.</p>
+<p><strong>First, the page boundary.</strong> Imagine a five-byte string at the very end of a readable page. Loading eight bytes from its first character would also read three bytes from the next page. If that page is inaccessible, the load faults. Masking the result afterwards cannot fix that.</p>
+<p>The <code>&amp; 2048</code> test checks address bit 11. To see why it works, consider a 4096-byte page:</p>
+<ul>
+<li>If <code>p</code> is in the first half, its offset is 0–2047. Reading eight bytes forwards cannot reach the page’s end. ClickHouse loads from <code>p</code>, then masks away the unwanted high bytes on a little-endian machine.</li>
+<li>If <code>p</code> is in the second half, ClickHouse loads from <code>p + sz - 8</code>. For a five-byte key, that’s three bytes <strong>before</strong> <code>p</code>. The load ends exactly at the string’s end, and starting at most seven bytes earlier cannot cross the page’s beginning.</li>
+</ul>
+<p><img src="page-boundary.svg" class="img-fluid" alt="Two views of a 4096-byte page. In the first half, ClickHouse can load forwards from a short key. Near the page end, it starts the eight-byte load before the key so that it ends at the key's end and avoids the inaccessible next page."></p>
+<p>For our five-byte key, the backward load looks like this:</p>
+<pre class="text"><code>loaded bytes:   ?  ?  ?  I  n  d  i  a
+shift right 24: I  n  d  i  a  0  0  0</code></pre>
+<p>Both directions produce the same packed integer. The question marks are neighboring bytes, not part of the key. The code also handles big-endian machines, reversing the direction of the mask or shift.</p>
+<p>The bit test is a cheap way to choose the load direction. It doesn’t call the OS to discover the page size. The 4 KiB example explains the relevant boundary; the reasoning also applies within larger aligned pages whose boundaries are multiples of 4 KiB.</p>
+<p><strong>Second, the buffer contract.</strong> Being on a readable page doesn’t by itself make an out-of-bounds C++ access valid. The source explicitly says that the dispatcher requires keys padded for eight-byte reads, and that an arbitrary <code>std::string</code> must not be passed here. A <code>std::string_view</code> only describes a pointer and a length; it doesn’t establish that surrounding bytes may be read.</p>
+<p>One supported source is <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Columns/ColumnString.h#L121-L125"><code>ColumnString::getDataAt()</code></a>. The column stores its string bytes in a <code>PaddedPODArray</code>, whose <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Common/PODArray_fwd.h#L24-L26">definition reserves padding on both sides</a>. A short key’s surrounding bytes can belong to neighboring strings or to that allocation’s padding. The mask or shift removes them from the result.</p>
+<p>So the page check explains the load direction, while the caller’s memory layout supplies the readable bytes around the key. This is an optimization built for ClickHouse’s controlled buffers. For a standalone buffer with only <code>size</code> readable bytes, the zero-initialized, exact-length <code>memcpy</code> from earlier is the appropriate version.</p>
+<p><strong>What about 9–24 bytes?</strong> Those keys are long enough to load the first complete word, or first two complete words, entirely within the string. The final load starts at <code>p + sz - 8</code>, so it also stays inside the string, overlapping the earlier load if necessary.</p>
+<p>For example, for the ten-byte key <code>abcdefghij</code>:</p>
+<pre class="text"><code>first load:    a b c d e f g h
+last load:        c d e f g h i j
+
+first word:    a b c d e f g h
+second word:   i j 0 0 0 0 0 0    (after shifting right by 48 bits)</code></pre>
+<p>This is how ClickHouse uses full-word loads without needing a separate tiny copy for every possible remainder length.</p>
+</section>
+<section id="hashing-the-packed-key" class="level4">
+<h4 class="anchored" data-anchor-id="hashing-the-packed-key">Hashing the packed key</h4>
+<p>Once the dispatcher has produced <code>k8</code>, it invokes:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb10"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="cf">return</span> func<span class="op">(</span>self<span class="op">.</span>m1<span class="op">,</span> k8<span class="op">,</span> hash<span class="op">(</span>k8<span class="op">));</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>The hash implementation is <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Common/HashTable/StringHashTable.h#L49-L75"><code>StringHashTableHash</code></a>, near the top of the same file. For an x86 build with SSE4.2 enabled, the eight-byte overload is:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb11"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="dt">size_t</span> ALWAYS_INLINE <span class="kw">operator</span><span class="op">()(</span>StringKey8 key<span class="op">)</span> <span class="at">const</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> res <span class="op">=</span> <span class="op">-</span><span class="dv">1</span><span class="bu">ULL</span><span class="op">;</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    res <span class="op">=</span> _mm_crc32_u64<span class="op">(</span>res<span class="op">,</span> key<span class="op">);</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> res<span class="op">;</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p><code>_mm_crc32_u64</code> uses the CPU’s CRC instruction to update a CRC-32C accumulator with a 64-bit word. The starting value here is all ones. Although the intrinsic accepts a 64-bit operand, the CRC result is 32 bits.</p>
+<p>The 16-byte overload chains two CRC instructions, and the 24-byte overload chains three. The file also has an ARM CRC path and other architecture-specific handling; when none of those paths is available, it uses CityHash for the packed keys. The generic string overload delegates to <code>StringViewHash</code>.</p>
+<p>CRC-32C is a fast checksum that ClickHouse uses as a hash here. Its collisions don’t merge different countries into one group: the table still compares the complete packed keys. Hash quality affects probing cost, while key equality determines whether two entries belong to the same group.</p>
+</section>
+<section id="the-operations-share-the-same-dispatcher" class="level4">
+<h4 class="anchored" data-anchor-id="the-operations-share-the-same-dispatcher">The operations share the same dispatcher</h4>
+<p>Finally, <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Common/HashTable/StringHashTable.h#L389-L435"><code>emplace</code> and <code>find</code></a> both go through <code>dispatch</code>:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb12"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Insert, or find an existing key.</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="kw">this</span><span class="op">-&gt;</span>dispatch<span class="op">(*</span><span class="kw">this</span><span class="op">,</span> key_holder<span class="op">,</span> EmplaceCallable<span class="op">(</span>it<span class="op">,</span> inserted<span class="op">));</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="co">// Look up a key.</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="cf">return</span> dispatch<span class="op">(*</span><span class="kw">this</span><span class="op">,</span> x<span class="op">,</span> FindCallable<span class="op">{});</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>The callable invokes the operation on whichever subtable the dispatcher chooses. That means insertion and lookup use the same representation and hash for a given key.</p>
+<p>I find this separation pretty neat. The short-key tables don’t need to know how a string was loaded or padded. They receive a fixed-size integer key, its hash, and an operation.</p>
+<hr>
+</section>
+</section>
+<section id="summary" class="level3">
+<h3 class="anchored" data-anchor-id="summary">Summary</h3>
+<p>String keys can make a hash table follow pointers and inspect bytes outside its own slots. For short strings, ClickHouse avoids that by packing the bytes into one, two, or three 64-bit words and storing them directly in the table.</p>
+<p>A dispatcher chooses the representation. Empty strings have their own cell, longer strings retain a pointer and a saved hash, and strings ending in a zero byte take the generic path so that their length is preserved.</p>
+<p>The full-word loads are part of the same design: choose a load direction, remove neighboring bytes, then hash and compare the resulting integers. Making this work depends on both the key representation and the memory layout of the buffers supplying it.</p>
+<hr>
+</section>
+<section id="credits-and-resources" class="level3">
+<h3 class="anchored" data-anchor-id="credits-and-resources">Credits and Resources</h3>
+<p>I used Codex to help adapt the video script and check the implementation against the source. The main resources are:</p>
+<ol type="1">
+<li><a href="https://www.mdpi.com/2076-3417/10/6/1915">SAHA: A String Adaptive Hash Table for Analytical Databases</a>, Tianqi Zheng, Zhibin Zhang, and Xueqi Cheng.</li>
+<li><a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Common/HashTable/StringHashTable.h">ClickHouse source: <code>StringHashTable.h</code></a> and <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Common/HashTable/StringHashMap.h"><code>StringHashMap.h</code></a>, v26.2.1.1139-stable.</li>
+<li><a href="https://clickhouse.com/blog/hash-tables-in-clickhouse-and-zero-cost-abstractions">Hash tables in ClickHouse and C++ Zero-cost Abstractions</a>, ClickHouse.</li>
+</ol>
+<hr>
+
+
+</section>
+
+</main> <!-- /main -->
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/thewalstreetjournal\.github\.io");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+</div> <!-- /content -->
+<div id="twsj-post-end" class="twsj-post-end" style="display: none;">
+  <hr>
+  <p class="twsj-post-end-links">
+    <a href="https://www.youtube.com/@TheWALStreetJournal?sub_confirmation=1">Subscribe on YouTube</a><span class="twsj-next-wrap" style="display: none;"> · <span class="twsj-next-label">Next post</span>: <a class="twsj-next-link" href="#"></a></span>
+  </p>
+  <p>Get new posts by email:</p>
+  <form action="https://buttondown.com/api/emails/embed-subscribe/thewalstreetjournal" method="post" target="popupwindow" onsubmit="window.open('https://buttondown.com/thewalstreetjournal', 'popupwindow')" class="embeddable-buttondown-form">
+    <div class="input-group" style="max-width: 420px;">
+      <input type="email" name="email" class="form-control" placeholder="you@example.com" aria-label="Email address" required="">
+      <button type="submit" class="btn btn-primary">Subscribe</button>
+    </div>
+  </form>
+</div>
+
+<script>
+(function () {
+  // Only on blog posts, not on the home page or About.
+  var path = window.location.pathname;
+  if (path.indexOf('/posts/') === -1) return;
+
+  var block = document.getElementById('twsj-post-end');
+  var main = document.getElementById('quarto-document-content');
+  if (!block || !main) return;
+  main.appendChild(block);
+  block.style.display = '';
+
+  // Normalise "/posts/x/", "/posts/x/index.html" and full URLs to "/posts/x/".
+  function postKey(url) {
+    var p = url.replace(/^https?:\/\/[^\/]+/, '').replace(/index\.html$/, '');
+    var i = p.indexOf('/posts/');
+    return i === -1 ? p : p.slice(i);
+  }
+
+  // The RSS feed has every post with its title and date.
+  fetch('/index.xml')
+    .then(function (r) { return r.text(); })
+    .then(function (text) {
+      var xml = new DOMParser().parseFromString(text, 'application/xml');
+      var posts = Array.prototype.map.call(xml.querySelectorAll('item'), function (item) {
+        return {
+          title: item.querySelector('title').textContent,
+          key: postKey(item.querySelector('link').textContent),
+          date: new Date(item.querySelector('pubDate').textContent)
+        };
+      }).sort(function (a, b) { return a.date - b.date; }); // oldest first
+
+      var here = postKey(path);
+      var i = posts.findIndex(function (p) { return p.key === here; });
+      if (i === -1 || posts.length < 2) return;
+
+      // The next newer post; on the newest post, the one before it.
+      var target = posts[i + 1], label = 'Next post';
+      if (!target) { target = posts[i - 1]; label = 'Previous post'; }
+
+      var wrap = block.querySelector('.twsj-next-wrap');
+      var link = block.querySelector('.twsj-next-link');
+      block.querySelector('.twsj-next-label').textContent = label;
+      link.textContent = target.title;
+      link.href = target.key;
+      wrap.style.display = '';
+    })
+    .catch(function () { /* No feed: keep the YouTube and email links only. */ });
+})();
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+
+
+
+
+</body></html>

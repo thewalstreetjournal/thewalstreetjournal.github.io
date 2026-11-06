@@ -10,7 +10,698 @@
 <atom:link href="https://thewalstreetjournal.github.io/index.xml" rel="self" type="application/rss+xml"/>
 <description>I like to explain to myself how databases work.</description>
 <generator>quarto-1.8.26</generator>
-<lastBuildDate>Wed, 04 Nov 2026 18:30:00 GMT</lastBuildDate>
+<lastBuildDate>Thu, 05 Nov 2026 18:30:00 GMT</lastBuildDate>
+<item>
+  <title>How ClickHouse Turns Strings Into Integers for Faster Hash Tables</title>
+  <link>https://thewalstreetjournal.github.io/posts/string-hashmaps-in-clickhouse/</link>
+  <description><![CDATA[ 
+
+
+
+
+
+
+<p>When we run a <code>GROUP BY</code> query on a string column, ClickHouse has a hash table that tries to treat the strings as integers. Why?</p>
+<p>Because short strings can fit directly inside a hash-table slot. We can hash and compare them as integers, without following a pointer to the string’s bytes somewhere else in memory.</p>
+<p>This design comes from <a href="https://www.mdpi.com/2076-3417/10/6/1915">SAHA: A String Adaptive Hash Table for Analytical Databases</a>. The paper reports improvements of up to five times over the hash tables it evaluated. Those are hash-table benchmark results, rather than a promise that every <code>GROUP BY</code> query becomes five times faster.</p>
+<p>Let’s build up the idea, then find it in the ClickHouse source. We’ll also cover the memory-safety detail I skipped in the video: how can we read eight bytes when a string only contains five?</p>
+<p>Prefer video? Here’s the same walkthrough:</p>
+<div class="quarto-video ratio ratio-16x9"><iframe data-external="1" src="https://www.youtube.com/embed/wFCXI9P6Trg" title="" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen=""></iframe></div>
+<hr>
+<section id="why-string-keys-make-hash-tables-work-harder" class="level3">
+<h3 class="anchored" data-anchor-id="why-string-keys-make-hash-tables-work-harder">Why string keys make hash tables work harder</h3>
+<p>Consider this query:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1" style="background: #f1f3f5;"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb1-1"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">SELECT</span> country, <span class="fu" style="color: #4758AB;
+background-color: null;
+font-style: inherit;">count</span>()</span>
+<span id="cb1-2"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">FROM</span> visits</span>
+<span id="cb1-3"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">GROUP</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">BY</span> country;</span></code></pre></div></div>
+<p>Conceptually, the aggregation hash table holds the country as its key and the count as its value.</p>
+<p>The slots in a hash table have a fixed size, but strings can be arbitrarily long. One common representation is a pointer and a length in the slot, with the actual bytes stored elsewhere. ClickHouse’s generic string-key representation uses a <code>std::string_view</code> like this.</p>
+<p>Say we’re looking up <code>India</code>, and its hash sends us to slot 5. We inspect the slot, follow the pointer, and find the bytes for <code>Japan</code>. The key doesn’t match, so we probe another slot and potentially follow another pointer.</p>
+<p><img src="https://thewalstreetjournal.github.io/posts/string-hashmaps-in-clickhouse/pointer-lookup.svg" class="img-fluid" alt="Looking up India: slot 5 points to Japan in separate string storage; slot 6 points to India. Both comparisons require following a pointer."></p>
+<p>The table’s slots are close together, but the strings they point to may be in different cache lines. When a comparison needs those bytes, it can cause another cache miss. Length checks and saved hashes can avoid some comparisons, but the indirection is still there when we need to inspect a string.</p>
+<p>Many useful grouping keys are short: country codes, status labels, and names like <code>India</code>. So why follow a pointer when the bytes would fit inside the slot itself?</p>
+<hr>
+</section>
+<section id="two-tables-and-a-dispatcher" class="level3">
+<h3 class="anchored" data-anchor-id="two-tables-and-a-dispatcher">Two tables and a dispatcher</h3>
+<p>At a high level, we could start with two implementations:</p>
+<ol type="1">
+<li>An optimized table for short strings, say eight bytes or fewer, storing the bytes directly in each slot.</li>
+<li>A fallback table for longer strings, storing a pointer and a length.</li>
+</ol>
+<p>A dispatcher receives an operation, checks the key’s length, and forwards it to the appropriate table. The caller still sees one hash-table interface.</p>
+<p>The long-string table is familiar. The interesting question is how we represent a short key.</p>
+<section id="doesnt-c-already-have-small-string-optimization" class="level4">
+<h4 class="anchored" data-anchor-id="doesnt-c-already-have-small-string-optimization">Doesn’t C++ already have small string optimization?</h4>
+<p>It does. With <strong>small string optimization</strong>, or SSO, a <code>std::string</code> can keep short strings inside the string object instead of allocating a separate buffer.</p>
+<p>But the object still carries metadata. Common implementations make a <code>std::string</code> object 24 or 32 bytes, depending on the standard library and ABI. That size applies whether the object lives on the stack, on the heap, or inside a hash-table slot.</p>
+<p>If our key only needs eight bytes, that’s a lot of space per aggregation bucket. Across millions of buckets, larger cells also mean fewer keys fit in a cache line.</p>
+<p>Instead, we can store those eight bytes as a plain <code>UInt64</code>:</p>
+<pre class="text"><code>string bytes:  I  n  d  i  a
+stored bytes:  I  n  d  i  a  0  0  0</code></pre>
+<p>On a little-endian machine, that integer is <code>0x0000006169646e49</code>. We’re preserving the character bytes, rather than parsing the text as a decimal number or replacing it with a hash.</p>
+<p>This gives us three useful properties:</p>
+<ol type="1">
+<li><strong>Compact keys.</strong> The key occupies eight bytes, excluding the count or other mapped value stored alongside it.</li>
+<li><strong>Fixed-size comparisons.</strong> We can compare the packed keys as integers. A string comparison can also use wide loads, but it has to handle a variable length.</li>
+<li><strong>Cheap hashing.</strong> We can feed the packed word directly to a hash function designed for fixed-size input.</li>
+</ol>
+<p>The integer is the key itself. A separate hash chooses the table slot, and collisions are still resolved by comparing keys.</p>
+<hr>
+</section>
+</section>
+<section id="loading-five-bytes-as-eight" class="level3">
+<h3 class="anchored" data-anchor-id="loading-five-bytes-as-eight">Loading five bytes as eight</h3>
+<p>How do we turn <code>India</code> into that integer?</p>
+<p>The straightforward, portable way is to initialize an integer to zero, then copy the string’s bytes into it:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3" style="background: #f1f3f5;"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb3-1"><span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">// For a key of at most eight bytes.</span></span>
+<span id="cb3-2"><span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">uint64_t</span> key <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">0</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb3-3">memcpy<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(&amp;</span>key<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> data<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> size<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span></code></pre></div></div>
+<p>For <code>India</code>, this copies five bytes and leaves three zero bytes. It is safe for an ordinary five-byte buffer.</p>
+<p>The difficulty is that <code>size</code> varies at runtime. Depending on the compiler and target, a variable-length copy can need several loads or branches to handle the different lengths. The CPU can copy five bytes; the point is to give it a simpler, fixed-size operation in this very hot path.</p>
+<p>ClickHouse instead loads a full eight-byte word, then removes the bytes that don’t belong to the key. A fixed eight-byte <code>memcpy</code> can compile to a single unaligned load on x86-64.</p>
+<p><img src="https://thewalstreetjournal.github.io/posts/string-hashmaps-in-clickhouse/packing-india.svg" class="img-fluid" alt="India is loaded together with three neighboring bytes. Masking removes the neighboring bytes, leaving I n d i a followed by three zero bytes, an eight-byte integer key."></p>
+<p>This reduces the work inside each size class. There are still branches for dispatching and for choosing a safe load direction. It doesn’t make the entire operation branch-free.</p>
+<p>And we can’t just read past a buffer because we plan to throw those bytes away. We’ll return to that when we reach the load in the source.</p>
+<hr>
+</section>
+<section id="in-the-source-code" class="level3">
+<h3 class="anchored" data-anchor-id="in-the-source-code">In the source code</h3>
+<p><a href="https://github.com/ClickHouse/ClickHouse">ClickHouse</a> is an open-source OLAP database with a framework of specialized hash tables. Its <a href="https://clickhouse.com/blog/hash-tables-in-clickhouse-and-zero-cost-abstractions">hash-table design post</a> gives a broader tour. Here, we’ll focus on the string-adaptive table.</p>
+<p>The code below is from <a href="https://github.com/ClickHouse/ClickHouse/tree/v26.2.1.1139-stable/src/Common/HashTable">v26.2.1.1139-stable</a>. ClickHouse has several aggregation paths; this is the string hash-table implementation we’re exploring, rather than a claim that every string grouping uses this exact path.</p>
+<section id="five-stores-behind-one-interface" class="level4">
+<h4 class="anchored" data-anchor-id="five-stores-behind-one-interface">Five stores behind one interface</h4>
+<p>In <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Common/HashTable/StringHashTable.h#L252-L256"><code>StringHashTable.h</code></a>, the <code>StringHashTable</code> class contains:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4" style="background: #f1f3f5;"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb4-1">T0 m0<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb4-2">T1 m1<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb4-3">T2 m2<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb4-4">T3 m3<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb4-5">Ts ms<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span></code></pre></div></div>
+<p>We started with two tables. ClickHouse takes the idea further:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 33%">
+<col style="width: 33%">
+<col style="width: 33%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Store</th>
+<th>Keys</th>
+<th>Representation</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>m0</code></td>
+<td>Empty string</td>
+<td>A dedicated cell</td>
+</tr>
+<tr class="even">
+<td><code>m1</code></td>
+<td>1–8 bytes</td>
+<td>One <code>UInt64</code></td>
+</tr>
+<tr class="odd">
+<td><code>m2</code></td>
+<td>9–16 bytes</td>
+<td>A <code>UInt128</code>, made of two 64-bit words</td>
+</tr>
+<tr class="even">
+<td><code>m3</code></td>
+<td>17–24 bytes</td>
+<td>A struct of three <code>UInt64</code> words</td>
+</tr>
+<tr class="odd">
+<td><code>ms</code></td>
+<td>25 bytes or more, <strong>or any nonempty key ending in a zero byte</strong></td>
+<td><code>std::string_view</code> with a saved hash</td>
+</tr>
+</tbody>
+</table>
+<p>The concrete map types are wired together in <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Common/HashTable/StringHashMap.h#L74-L85"><code>StringHashMap.h</code></a>. The nonempty subtables grow independently, so inserting a key in <code>m1</code> doesn’t require resizing all the others.</p>
+<p><img src="https://thewalstreetjournal.github.io/posts/string-hashmaps-in-clickhouse/string-dispatch.svg" class="img-fluid" alt="A string key enters the dispatcher, which chooses m0 for an empty key, m1 for 1–8 bytes, m2 for 9–16 bytes, m3 for 17–24 bytes, or ms for longer keys. Keys ending in a zero byte also go to ms."></p>
+</section>
+<section id="the-dispatcher" class="level4">
+<h4 class="anchored" data-anchor-id="the-dispatcher">The dispatcher</h4>
+<p><a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Common/HashTable/StringHashTable.h#L295-L334"><code>dispatch</code></a> receives the key and a callable describing the operation to perform. First, it handles two special cases:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5" style="background: #f1f3f5;"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb5-1"><span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">const</span> <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">auto</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&amp;</span> x <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> keyHolderGetKey<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>key_holder<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb5-2"><span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">const</span> <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">size_t</span> sz <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> x<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>size<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">();</span></span>
+<span id="cb5-3"><span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">if</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>sz <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">==</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">0</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span></span>
+<span id="cb5-4"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb5-5">    keyHolderDiscardKey<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>key_holder<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb5-6">    <span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">return</span> func<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>self<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>m0<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> VoidKey<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{},</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">0</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb5-7"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span></span>
+<span id="cb5-8"></span>
+<span id="cb5-9"><span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">if</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>x<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">[</span>sz <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">1</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">]</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">==</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">0</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span></span>
+<span id="cb5-10"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb5-11">    <span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">return</span> func<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>self<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>ms<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> <span class="bu" style="color: null;
+background-color: null;
+font-style: inherit;">std::</span>forward<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&lt;</span>KeyHolder<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&gt;(</span>key_holder<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">),</span> hash<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>x<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">));</span></span>
+<span id="cb5-12"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span></span></code></pre></div></div>
+<p>Why route strings ending in zero to the generic table?</p>
+<p>Because our packed representation doesn’t store an explicit length. <code>India</code> and <code>India\0</code> would produce the same eight-byte value after zero padding. To distinguish them, the latter must use <code>ms</code>, which retains the length. This also lets ClickHouse reconstruct a packed key’s length by counting zero bytes at the end of the word. Embedded zero bytes are fine; the last byte of a packed key must be nonzero.</p>
+<p>Next comes the size dispatch:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6" style="background: #f1f3f5;"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb6-1"><span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">const</span> <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">char</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">*</span> p <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> x<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>data<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">();</span></span>
+<span id="cb6-2"><span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">const</span> <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">char</span> s <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(-</span>sz <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&amp;</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">7</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">*</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">8</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb6-3"></span>
+<span id="cb6-4"><span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">switch</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">((</span>sz <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">1</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&gt;&gt;</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">3</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span></span>
+<span id="cb6-5"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb6-6">    <span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">case</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">0</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">:</span> <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">// 1..8 bytes</span></span>
+<span id="cb6-7">        <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">// Pack into k8 and call func(self.m1, k8, hash(k8)).</span></span>
+<span id="cb6-8">    <span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">case</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">1</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">:</span> <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">// 9..16 bytes</span></span>
+<span id="cb6-9">        <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">// Pack into k16 and call func(self.m2, k16, hash(k16)).</span></span>
+<span id="cb6-10">    <span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">case</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">2</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">:</span> <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">// 17..24 bytes</span></span>
+<span id="cb6-11">        <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">// Pack into k24 and call func(self.m3, k24, hash(k24)).</span></span>
+<span id="cb6-12">    <span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">default</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">:</span> <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">// &gt;= 25 bytes</span></span>
+<span id="cb6-13">        <span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">// Forward the string key to ms.</span></span>
+<span id="cb6-14"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span></span></code></pre></div></div>
+<p>This is an outline of the switch; each real case returns after calling the operation.</p>
+<p><code>(sz - 1) &gt;&gt; 3</code> groups lengths into eight-byte ranges. <code>s</code> is the number of bits to clear or shift away in the final word. For five bytes, <code>s</code> is 24. For eight bytes, it’s zero.</p>
+</section>
+<section id="the-memory-safety-detail-where-do-we-load-from" class="level4">
+<h4 class="anchored" data-anchor-id="the-memory-safety-detail-where-do-we-load-from">The memory-safety detail: where do we load from?</h4>
+<p>Here’s the part I left out of the video. In the <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Common/HashTable/StringHashTable.h#L335-L356">1–8 byte case</a>, the little-endian path is equivalent to this:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb7" style="background: #f1f3f5;"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb7-1"><span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">// Simplified: little-endian path only.</span></span>
+<span id="cb7-2"><span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">uint64_t</span> packed<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb7-3"><span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">if</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">((</span><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">reinterpret_cast</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&lt;</span><span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">uintptr_t</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&gt;(</span>p<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&amp;</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">2048</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">==</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">0</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span></span>
+<span id="cb7-4"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb7-5">    memcpy<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(&amp;</span>packed<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> p<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">8</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb7-6">    packed <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&amp;=</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-</span><span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">1</span><span class="bu" style="color: null;
+background-color: null;
+font-style: inherit;">ULL</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&gt;&gt;</span> s<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb7-7"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span></span>
+<span id="cb7-8"><span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">else</span></span>
+<span id="cb7-9"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb7-10">    <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">const</span> <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">char</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">*</span> load_start <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> p <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">+</span> sz <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">8</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb7-11">    memcpy<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(&amp;</span>packed<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> load_start<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> <span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">8</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb7-12">    packed <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">&gt;&gt;=</span> s<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb7-13"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span></span></code></pre></div></div>
+<p>There are two separate issues here: staying within readable memory pages, and satisfying the buffer’s allocation contract.</p>
+<p><strong>First, the page boundary.</strong> Imagine a five-byte string at the very end of a readable page. Loading eight bytes from its first character would also read three bytes from the next page. If that page is inaccessible, the load faults. Masking the result afterwards cannot fix that.</p>
+<p>The <code>&amp; 2048</code> test checks address bit 11. To see why it works, consider a 4096-byte page:</p>
+<ul>
+<li>If <code>p</code> is in the first half, its offset is 0–2047. Reading eight bytes forwards cannot reach the page’s end. ClickHouse loads from <code>p</code>, then masks away the unwanted high bytes on a little-endian machine.</li>
+<li>If <code>p</code> is in the second half, ClickHouse loads from <code>p + sz - 8</code>. For a five-byte key, that’s three bytes <strong>before</strong> <code>p</code>. The load ends exactly at the string’s end, and starting at most seven bytes earlier cannot cross the page’s beginning.</li>
+</ul>
+<p><img src="https://thewalstreetjournal.github.io/posts/string-hashmaps-in-clickhouse/page-boundary.svg" class="img-fluid" alt="Two views of a 4096-byte page. In the first half, ClickHouse can load forwards from a short key. Near the page end, it starts the eight-byte load before the key so that it ends at the key's end and avoids the inaccessible next page."></p>
+<p>For our five-byte key, the backward load looks like this:</p>
+<pre class="text"><code>loaded bytes:   ?  ?  ?  I  n  d  i  a
+shift right 24: I  n  d  i  a  0  0  0</code></pre>
+<p>Both directions produce the same packed integer. The question marks are neighboring bytes, not part of the key. The code also handles big-endian machines, reversing the direction of the mask or shift.</p>
+<p>The bit test is a cheap way to choose the load direction. It doesn’t call the OS to discover the page size. The 4 KiB example explains the relevant boundary; the reasoning also applies within larger aligned pages whose boundaries are multiples of 4 KiB.</p>
+<p><strong>Second, the buffer contract.</strong> Being on a readable page doesn’t by itself make an out-of-bounds C++ access valid. The source explicitly says that the dispatcher requires keys padded for eight-byte reads, and that an arbitrary <code>std::string</code> must not be passed here. A <code>std::string_view</code> only describes a pointer and a length; it doesn’t establish that surrounding bytes may be read.</p>
+<p>One supported source is <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Columns/ColumnString.h#L121-L125"><code>ColumnString::getDataAt()</code></a>. The column stores its string bytes in a <code>PaddedPODArray</code>, whose <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Common/PODArray_fwd.h#L24-L26">definition reserves padding on both sides</a>. A short key’s surrounding bytes can belong to neighboring strings or to that allocation’s padding. The mask or shift removes them from the result.</p>
+<p>So the page check explains the load direction, while the caller’s memory layout supplies the readable bytes around the key. This is an optimization built for ClickHouse’s controlled buffers. For a standalone buffer with only <code>size</code> readable bytes, the zero-initialized, exact-length <code>memcpy</code> from earlier is the appropriate version.</p>
+<p><strong>What about 9–24 bytes?</strong> Those keys are long enough to load the first complete word, or first two complete words, entirely within the string. The final load starts at <code>p + sz - 8</code>, so it also stays inside the string, overlapping the earlier load if necessary.</p>
+<p>For example, for the ten-byte key <code>abcdefghij</code>:</p>
+<pre class="text"><code>first load:    a b c d e f g h
+last load:        c d e f g h i j
+
+first word:    a b c d e f g h
+second word:   i j 0 0 0 0 0 0    (after shifting right by 48 bits)</code></pre>
+<p>This is how ClickHouse uses full-word loads without needing a separate tiny copy for every possible remainder length.</p>
+</section>
+<section id="hashing-the-packed-key" class="level4">
+<h4 class="anchored" data-anchor-id="hashing-the-packed-key">Hashing the packed key</h4>
+<p>Once the dispatcher has produced <code>k8</code>, it invokes:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb10" style="background: #f1f3f5;"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb10-1"><span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">return</span> func<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>self<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">.</span>m1<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> k8<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> hash<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>k8<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">));</span></span></code></pre></div></div>
+<p>The hash implementation is <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Common/HashTable/StringHashTable.h#L49-L75"><code>StringHashTableHash</code></a>, near the top of the same file. For an x86 build with SSE4.2 enabled, the eight-byte overload is:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb11" style="background: #f1f3f5;"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb11-1"><span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">size_t</span> ALWAYS_INLINE <span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">operator</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">()(</span>StringKey8 key<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">)</span> <span class="at" style="color: #657422;
+background-color: null;
+font-style: inherit;">const</span></span>
+<span id="cb11-2"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{</span></span>
+<span id="cb11-3">    <span class="dt" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">size_t</span> res <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-</span><span class="dv" style="color: #AD0000;
+background-color: null;
+font-style: inherit;">1</span><span class="bu" style="color: null;
+background-color: null;
+font-style: inherit;">ULL</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb11-4">    res <span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">=</span> _mm_crc32_u64<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>res<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> key<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">);</span></span>
+<span id="cb11-5">    <span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">return</span> res<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">;</span></span>
+<span id="cb11-6"><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">}</span></span></code></pre></div></div>
+<p><code>_mm_crc32_u64</code> uses the CPU’s CRC instruction to update a CRC-32C accumulator with a 64-bit word. The starting value here is all ones. Although the intrinsic accepts a 64-bit operand, the CRC result is 32 bits.</p>
+<p>The 16-byte overload chains two CRC instructions, and the 24-byte overload chains three. The file also has an ARM CRC path and other architecture-specific handling; when none of those paths is available, it uses CityHash for the packed keys. The generic string overload delegates to <code>StringViewHash</code>.</p>
+<p>CRC-32C is a fast checksum that ClickHouse uses as a hash here. Its collisions don’t merge different countries into one group: the table still compares the complete packed keys. Hash quality affects probing cost, while key equality determines whether two entries belong to the same group.</p>
+</section>
+<section id="the-operations-share-the-same-dispatcher" class="level4">
+<h4 class="anchored" data-anchor-id="the-operations-share-the-same-dispatcher">The operations share the same dispatcher</h4>
+<p>Finally, <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Common/HashTable/StringHashTable.h#L389-L435"><code>emplace</code> and <code>find</code></a> both go through <code>dispatch</code>:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb12" style="background: #f1f3f5;"><pre class="sourceCode cpp code-with-copy"><code class="sourceCode cpp"><span id="cb12-1"><span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">// Insert, or find an existing key.</span></span>
+<span id="cb12-2"><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">this</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">-&gt;</span>dispatch<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(*</span><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">this</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> key_holder<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> EmplaceCallable<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(</span>it<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> inserted<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">));</span></span>
+<span id="cb12-3"></span>
+<span id="cb12-4"><span class="co" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">// Look up a key.</span></span>
+<span id="cb12-5"><span class="cf" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">return</span> dispatch<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">(*</span><span class="kw" style="color: #003B4F;
+background-color: null;
+font-weight: bold;
+font-style: inherit;">this</span><span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> x<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">,</span> FindCallable<span class="op" style="color: #5E5E5E;
+background-color: null;
+font-style: inherit;">{});</span></span></code></pre></div></div>
+<p>The callable invokes the operation on whichever subtable the dispatcher chooses. That means insertion and lookup use the same representation and hash for a given key.</p>
+<p>I find this separation pretty neat. The short-key tables don’t need to know how a string was loaded or padded. They receive a fixed-size integer key, its hash, and an operation.</p>
+<hr>
+</section>
+</section>
+<section id="summary" class="level3">
+<h3 class="anchored" data-anchor-id="summary">Summary</h3>
+<p>String keys can make a hash table follow pointers and inspect bytes outside its own slots. For short strings, ClickHouse avoids that by packing the bytes into one, two, or three 64-bit words and storing them directly in the table.</p>
+<p>A dispatcher chooses the representation. Empty strings have their own cell, longer strings retain a pointer and a saved hash, and strings ending in a zero byte take the generic path so that their length is preserved.</p>
+<p>The full-word loads are part of the same design: choose a load direction, remove neighboring bytes, then hash and compare the resulting integers. Making this work depends on both the key representation and the memory layout of the buffers supplying it.</p>
+<hr>
+</section>
+<section id="credits-and-resources" class="level3">
+<h3 class="anchored" data-anchor-id="credits-and-resources">Credits and Resources</h3>
+<p>I used Codex to help adapt the video script and check the implementation against the source. The main resources are:</p>
+<ol type="1">
+<li><a href="https://www.mdpi.com/2076-3417/10/6/1915">SAHA: A String Adaptive Hash Table for Analytical Databases</a>, Tianqi Zheng, Zhibin Zhang, and Xueqi Cheng.</li>
+<li><a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Common/HashTable/StringHashTable.h">ClickHouse source: <code>StringHashTable.h</code></a> and <a href="https://github.com/ClickHouse/ClickHouse/blob/v26.2.1.1139-stable/src/Common/HashTable/StringHashMap.h"><code>StringHashMap.h</code></a>, v26.2.1.1139-stable.</li>
+<li><a href="https://clickhouse.com/blog/hash-tables-in-clickhouse-and-zero-cost-abstractions">Hash tables in ClickHouse and C++ Zero-cost Abstractions</a>, ClickHouse.</li>
+</ol>
+<hr>
+
+
+</section>
+
+ ]]></description>
+  <category>clickhouse</category>
+  <category>internals</category>
+  <category>hash-tables</category>
+  <guid>https://thewalstreetjournal.github.io/posts/string-hashmaps-in-clickhouse/</guid>
+  <pubDate>Thu, 05 Nov 2026 18:30:00 GMT</pubDate>
+  <media:content url="https://thewalstreetjournal.github.io/posts/string-hashmaps-in-clickhouse/string-dispatch.png" medium="image" type="image/png" height="81" width="144"/>
+</item>
 <item>
   <title>A Closer Look at DataFusion Preimage Rewrites</title>
   <link>https://thewalstreetjournal.github.io/posts/a-closer-look-at-datafusion-preimage-rewrites/</link>

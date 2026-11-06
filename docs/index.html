@@ -151,15 +151,15 @@ window.Quarto = {
 <link rel="stylesheet" href="styles.css">
 <link rel="alternate" type="application/rss+xml" title="The WAL Street Journal" href="index.xml" data-external="1"><meta property="og:title" content="The WAL Street Journal">
 <meta property="og:description" content="I like to explain to myself how databases work.">
-<meta property="og:image" content="https://thewalstreetjournal.github.io/posts/a-closer-look-at-datafusion-preimage-rewrites/preimage-rewrite.png">
+<meta property="og:image" content="https://thewalstreetjournal.github.io/posts/string-hashmaps-in-clickhouse/string-dispatch.png">
 <meta property="og:site_name" content="The WAL Street Journal">
-<meta property="og:image:alt" content="Expression tree for floor(col) = 3 rewritten into col &amp;gt;= 3 AND col < 4.">
+<meta property="og:image:alt" content="A dispatcher routes string keys to five stores: empty, 8-byte, 16-byte, 24-byte, and a generic string table.">
 <meta property="og:image:height" content="2160">
 <meta property="og:image:width" content="3840">
 <meta name="twitter:title" content="The WAL Street Journal">
 <meta name="twitter:description" content="I like to explain to myself how databases work.">
-<meta name="twitter:image" content="https://thewalstreetjournal.github.io/posts/a-closer-look-at-datafusion-preimage-rewrites/preimage-rewrite.png">
-<meta name="twitter:image:alt" content="Expression tree for floor(col) = 3 rewritten into col &amp;gt;= 3 AND col < 4.">
+<meta name="twitter:image" content="https://thewalstreetjournal.github.io/posts/string-hashmaps-in-clickhouse/string-dispatch.png">
+<meta name="twitter:image:alt" content="A dispatcher routes string keys to five stores: empty, 8-byte, 16-byte, 24-byte, and a generic string table.">
 <meta name="twitter:image-height" content="2160">
 <meta name="twitter:image-width" content="3840">
 <meta name="twitter:card" content="summary_large_image">
@@ -404,7 +404,7 @@ window.Quarto = {
 <!-- margin-sidebar -->
     <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
         
-    <h5 class="quarto-listing-category-title">Categories</h5><div class="quarto-listing-category category-default"><div class="category" data-category="">All <span class="quarto-category-count">(6)</span></div><div class="category" data-category="Y2xpY2tob3VzZQ==">clickhouse <span class="quarto-category-count">(1)</span></div><div class="category" data-category="ZGF0YWZ1c2lvbg==">datafusion <span class="quarto-category-count">(1)</span></div><div class="category" data-category="aW50ZXJuYWxz">internals <span class="quarto-category-count">(6)</span></div><div class="category" data-category="cG9zdGdyZXM=">postgres <span class="quarto-category-count">(4)</span></div><div class="category" data-category="cXVlcnktb3B0aW1pemF0aW9u">query-optimization <span class="quarto-category-count">(1)</span></div></div></div>
+    <h5 class="quarto-listing-category-title">Categories</h5><div class="quarto-listing-category category-default"><div class="category" data-category="">All <span class="quarto-category-count">(7)</span></div><div class="category" data-category="Y2xpY2tob3VzZQ==">clickhouse <span class="quarto-category-count">(2)</span></div><div class="category" data-category="ZGF0YWZ1c2lvbg==">datafusion <span class="quarto-category-count">(1)</span></div><div class="category" data-category="aGFzaC10YWJsZXM=">hash-tables <span class="quarto-category-count">(1)</span></div><div class="category" data-category="aW50ZXJuYWxz">internals <span class="quarto-category-count">(7)</span></div><div class="category" data-category="cG9zdGdyZXM=">postgres <span class="quarto-category-count">(4)</span></div><div class="category" data-category="cXVlcnktb3B0aW1pemF0aW9u">query-optimization <span class="quarto-category-count">(1)</span></div></div></div>
 <!-- main -->
 <main class="content quarto-banner-title-block column-page-left" id="quarto-document-content">
 
@@ -441,7 +441,39 @@ window.Quarto = {
     </div>
 </div>
 <div class="list quarto-listing-default">
-<div class="quarto-post image-right" data-index="0" data-categories="ZGF0YWZ1c2lvbiUyQ2ludGVybmFscyUyQ3F1ZXJ5LW9wdGltaXphdGlvbg==" data-listing-date-sort="1793817000000" data-listing-file-modified-sort="1793946106650" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="5" data-listing-word-count-sort="936">
+<div class="quarto-post image-right" data-index="0" data-categories="Y2xpY2tob3VzZSUyQ2ludGVybmFscyUyQ2hhc2gtdGFibGVz" data-listing-date-sort="1793903400000" data-listing-file-modified-sort="1793953376579" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="13" data-listing-word-count-sort="2515">
+<div class="thumbnail"><a href="./posts/string-hashmaps-in-clickhouse/index.html" class="no-external">
+
+<img loading="lazy" src="./posts/string-hashmaps-in-clickhouse/string-dispatch.png" class="thumbnail-image" alt="A dispatcher routes string keys to five stores: empty, 8-byte, 16-byte, 24-byte, and a generic string table.">
+
+</a></div>
+<div class="body">
+<h3 class="no-anchor listing-title">
+<a href="./posts/string-hashmaps-in-clickhouse/index.html" class="no-external">How ClickHouse Turns Strings Into Integers for Faster Hash Tables</a>
+</h3>
+<div class="listing-categories">
+
+<div class="listing-category" onclick="window.quartoListingCategory('Y2xpY2tob3VzZQ=='); return false;">clickhouse</div>
+
+<div class="listing-category" onclick="window.quartoListingCategory('aW50ZXJuYWxz'); return false;">internals</div>
+
+<div class="listing-category" onclick="window.quartoListingCategory('aGFzaC10YWJsZXM='); return false;">hash-tables</div>
+
+</div>
+<div class="delink listing-description"><a href="./posts/string-hashmaps-in-clickhouse/index.html" class="no-external">
+<p>ClickHouse stores short string keys as integers. A walkthrough of its string-adaptive hash table, including how its eight-byte reads handle memory boundaries.</p>
+</a></div>
+</div>
+<div class="metadata">
+<a href="./posts/string-hashmaps-in-clickhouse/index.html" class="no-external">
+<div class="listing-date">
+Nov 6, 2026
+</div>
+<div class="listing-reading-time">13 min</div>
+</a>
+</div>
+</div>
+<div class="quarto-post image-right" data-index="1" data-categories="ZGF0YWZ1c2lvbiUyQ2ludGVybmFscyUyQ3F1ZXJ5LW9wdGltaXphdGlvbg==" data-listing-date-sort="1793817000000" data-listing-file-modified-sort="1793946106650" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="5" data-listing-word-count-sort="936">
 <div class="thumbnail"><a href="./posts/a-closer-look-at-datafusion-preimage-rewrites/index.html" class="no-external">
 
 <img loading="lazy" src="./posts/a-closer-look-at-datafusion-preimage-rewrites/preimage-rewrite.png" class="thumbnail-image" alt="Expression tree for floor(col) = 3 rewritten into col &amp;gt;= 3 AND col < 4.">
@@ -473,7 +505,7 @@ Nov 5, 2026
 </a>
 </div>
 </div>
-<div class="quarto-post image-right" data-index="1" data-categories="Y2xpY2tob3VzZSUyQ2ludGVybmFscw==" data-listing-date-sort="1791311400000" data-listing-file-modified-sort="1791446576189" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="10" data-listing-word-count-sort="1872">
+<div class="quarto-post image-right" data-index="2" data-categories="Y2xpY2tob3VzZSUyQ2ludGVybmFscw==" data-listing-date-sort="1791311400000" data-listing-file-modified-sort="1791446576189" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="10" data-listing-word-count-sort="1872">
 <div class="thumbnail"><a href="./posts/clickhouse-keeper-non-blocking-snapshots/index.html" class="no-external">
 
 <img loading="lazy" src="./posts/clickhouse-keeper-non-blocking-snapshots/snapshot-update-cow.png" class="thumbnail-image">
@@ -503,7 +535,7 @@ Oct 7, 2026
 </a>
 </div>
 </div>
-<div class="quarto-post image-right" data-index="2" data-categories="cG9zdGdyZXMlMkNpbnRlcm5hbHM=" data-listing-date-sort="1790879400000" data-listing-file-modified-sort="1791448103686" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="14" data-listing-word-count-sort="2609">
+<div class="quarto-post image-right" data-index="3" data-categories="cG9zdGdyZXMlMkNpbnRlcm5hbHM=" data-listing-date-sort="1790879400000" data-listing-file-modified-sort="1791448103686" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="14" data-listing-word-count-sort="2609">
 <div class="thumbnail"><a href="./posts/inside-the-postgres-wal/index.html" class="no-external">
 
 <img loading="lazy" src="./posts/inside-the-postgres-wal/wal-segments-pages.png" class="thumbnail-image">
@@ -533,7 +565,7 @@ Oct 2, 2026
 </a>
 </div>
 </div>
-<div class="quarto-post image-right" data-index="3" data-categories="cG9zdGdyZXMlMkNpbnRlcm5hbHM=" data-listing-date-sort="1780857000000" data-listing-file-modified-sort="1791443224133" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="12" data-listing-word-count-sort="2204">
+<div class="quarto-post image-right" data-index="4" data-categories="cG9zdGdyZXMlMkNpbnRlcm5hbHM=" data-listing-date-sort="1780857000000" data-listing-file-modified-sort="1791443224133" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="12" data-listing-word-count-sort="2204">
 <div class="thumbnail"><a href="./posts/postgres-free-space-map/index.html" class="no-external">
 
 <img loading="lazy" src="./posts/postgres-free-space-map/fsm-three-levels.png" class="thumbnail-image">
@@ -563,7 +595,7 @@ Jun 8, 2026
 </a>
 </div>
 </div>
-<div class="quarto-post image-right" data-index="4" data-categories="cG9zdGdyZXMlMkNpbnRlcm5hbHM=" data-listing-date-sort="1774722600000" data-listing-file-modified-sort="1791448263430" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="17" data-listing-word-count-sort="3269">
+<div class="quarto-post image-right" data-index="5" data-categories="cG9zdGdyZXMlMkNpbnRlcm5hbHM=" data-listing-date-sort="1774722600000" data-listing-file-modified-sort="1791448263430" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="17" data-listing-word-count-sort="3269">
 <div class="thumbnail"><a href="./posts/how-postgres-stores-data/index.html" class="no-external">
 
 <img loading="lazy" src="./posts/how-postgres-stores-data/page-layout.png" class="thumbnail-image">
@@ -593,7 +625,7 @@ Mar 29, 2026
 </a>
 </div>
 </div>
-<div class="quarto-post image-right" data-index="5" data-categories="cG9zdGdyZXMlMkNpbnRlcm5hbHM=" data-listing-date-sort="1773513000000" data-listing-file-modified-sort="1791405336380" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="11" data-listing-word-count-sort="2157">
+<div class="quarto-post image-right" data-index="6" data-categories="cG9zdGdyZXMlMkNpbnRlcm5hbHM=" data-listing-date-sort="1773513000000" data-listing-file-modified-sort="1791405336380" data-listing-date-modified-sort="NaN" data-listing-reading-time-sort="11" data-listing-word-count-sort="2157">
 <div class="thumbnail"><a href="./posts/how-postgres-handles-connections/index.html" class="no-external">
 
 <img loading="lazy" src="./posts/how-postgres-handles-connections/process-per-connection.png" class="thumbnail-image">
